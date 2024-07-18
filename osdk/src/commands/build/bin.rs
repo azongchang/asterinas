@@ -157,7 +157,13 @@ fn install_setup_with_arch(
     cmd.arg("install").arg("linux-bzimage-setup");
     cmd.arg("--force");
     cmd.arg("--root").arg(install_dir.as_ref());
-    cmd.arg("--path").arg("../../../ostd/libs/linux-bzimage/setup");
+    if let Ok(_) = std::env::var("OSDK_INTEGRATION_TEST") {
+        cmd.arg("--path").arg("../../../ostd/libs/linux-bzimage/setup");
+    } else {
+        cmd.arg("--git").arg(crate::util::ASTER_GIT_LINK);
+        // FIXME: Uses a fixed tag instaed of relies on remote branch
+        cmd.arg("--tag").arg("v0.5.1");
+    }
     // cmd.arg("--tag").arg(crate::util::ASTER_GIT_TAG);
     cmd.arg("--target").arg(match arch {
         SetupInstallArch::X86_64 => "x86_64-unknown-none",
