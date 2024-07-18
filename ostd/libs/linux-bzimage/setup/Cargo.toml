@@ -17,6 +17,8 @@ cfg-if = "1.0.0"
 linux-boot-params = { path = "../boot-params", version = "0.1.0" }
 uart_16550 = "0.3.0"
 xmas-elf = "0.8.0"
+libflate = { version = "2.1.0", default-features = false }
+core2 = { version = "0.4.0", default-features = false, features = ["nightly"] }
 
 [target.x86_64-unknown-none.dependencies]
 bitflags = "2.4.1"

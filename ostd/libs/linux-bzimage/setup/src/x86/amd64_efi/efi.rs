@@ -10,6 +10,7 @@ use uefi::{
 use super::{
     paging::{Ia32eFlags, PageNumber, PageTableCreator},
     relocation::apply_rela_dyn_relocations,
+    decoder::decompress_payload,
 };
 
 // Suppress warnings since using todo!.
@@ -55,9 +56,12 @@ fn efi_phase_boot(
 
     uefi_services::println!("[EFI stub] Relocations applied.");
 
-    uefi_services::println!("[EFI stub] Loading payload.");
+    uefi_services::println!("[EFI stub] Decompressing payload.");
     let payload = unsafe { crate::get_payload(&*boot_params_ptr) };
-    crate::loader::load_elf(payload);
+    let kernel = decompress_payload(payload);
+
+    uefi_services::println!("[EFI stub] Loading payload.");
+    crate::loader::load_elf(&kernel);
 
     uefi_services::println!("[EFI stub] Exiting EFI boot services.");
     let memory_type = {
