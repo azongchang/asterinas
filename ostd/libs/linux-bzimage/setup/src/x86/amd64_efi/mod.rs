@@ -3,6 +3,7 @@
 mod efi;
 mod paging;
 mod relocation;
+mod decoder;
 
 use core::arch::{asm, global_asm};
 
