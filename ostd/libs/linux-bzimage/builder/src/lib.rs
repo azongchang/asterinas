@@ -63,7 +63,10 @@ pub fn make_bzimage(
         .unwrap()
         .read_to_end(&mut kernel)
         .unwrap();
-    let payload = compress_kernel(&kernel);
+    let payload = match image_type {
+        BzImageType::Legacy32 => kernel,
+        BzImageType::Efi64 => compress_kernel(&kernel),
+    };
 
     let setup_len = setup.len();
     let payload_len = payload.len();

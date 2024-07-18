@@ -56,12 +56,17 @@ fn efi_phase_boot(
 
     uefi_services::println!("[EFI stub] Relocations applied.");
 
-    uefi_services::println!("[EFI stub] Decompressing payload.");
     let payload = unsafe { crate::get_payload(&*boot_params_ptr) };
-    let kernel = decompress_payload(payload);
+    let kernel = match &payload[0..4] {
+        &[0x7F, 0x45, 0x4C, 0x46] => payload,
+        _ => {
+            uefi_services::println!("[EFI stub] Decompressing payload.");
+            &decompress_payload(payload)
+        },
+    };
 
     uefi_services::println!("[EFI stub] Loading payload.");
-    crate::loader::load_elf(&kernel);
+    crate::loader::load_elf(kernel);
 
     uefi_services::println!("[EFI stub] Exiting EFI boot services.");
     let memory_type = {
