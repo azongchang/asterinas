@@ -157,7 +157,7 @@ fn install_setup_with_arch(
     cmd.arg("install").arg("linux-bzimage-setup");
     cmd.arg("--force");
     cmd.arg("--root").arg(install_dir.as_ref());
-    if let Ok(_) = std::env::var("OSDK_INTEGRATION_TEST") {
+    if let Ok(_) = std::env::var("AUTO_TEST") {
         cmd.arg("--path").arg("../../../ostd/libs/linux-bzimage/setup");
     } else {
         cmd.arg("--git").arg(crate::util::ASTER_GIT_LINK);
