@@ -158,7 +158,8 @@ fn install_setup_with_arch(
     cmd.arg("--force");
     cmd.arg("--root").arg(install_dir.as_ref());
     if std::env::var("AUTO_TEST").is_ok() {
-        cmd.arg("--path").arg("../../../ostd/libs/linux-bzimage/setup");
+        cmd.arg("--path")
+            .arg("../../../ostd/libs/linux-bzimage/setup");
     } else {
         // Remember to upgrade this version if new version of linux-bzimage-setup is released.
         const LINUX_BZIMAGE_SETUP_VERSION: &str = "0.1.0";
