@@ -160,9 +160,9 @@ fn install_setup_with_arch(
     if let Ok(_) = std::env::var("AUTO_TEST") {
         cmd.arg("--path").arg("../../../ostd/libs/linux-bzimage/setup");
     } else {
-        cmd.arg("--git").arg(crate::util::ASTER_GIT_LINK);
-        // FIXME: Uses a fixed tag instaed of relies on remote branch
-        cmd.arg("--tag").arg("v0.5.1");
+        // Remember to upgrade this version if new version of linux-bzimage-setup is released.
+        const LINUX_BZIMAGE_SETUP_VERSION: &str = "0.1.0";
+        cmd.arg("--version").arg(LINUX_BZIMAGE_SETUP_VERSION);
     }
     // cmd.arg("--tag").arg(crate::util::ASTER_GIT_TAG);
     cmd.arg("--target").arg(match arch {
