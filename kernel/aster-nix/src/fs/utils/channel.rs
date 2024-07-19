@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use aster_rights::{Read, ReadOp, TRights, Write, WriteOp};
@@ -12,7 +10,7 @@ use super::StatusFlags;
 use crate::{
     events::{IoEvents, Observer},
     prelude::*,
-    process::signal::{Pollee, Poller},
+    process::signal::{Pollable, Pollee, Poller},
 };
 
 /// A unidirectional communication channel, intended to implement IPC, e.g., pipe,
@@ -29,8 +27,8 @@ impl<T> Channel<T> {
 
     pub fn with_capacity_and_flags(capacity: usize, flags: StatusFlags) -> Result<Self> {
         let common = Arc::new(Common::with_capacity_and_flags(capacity, flags)?);
-        let producer = Producer(EndPoint::new(common.clone(), WriteOp::new()));
-        let consumer = Consumer(EndPoint::new(common, ReadOp::new()));
+        let producer = Producer(Fifo::new(common.clone()));
+        let consumer = Consumer(Fifo::new(common));
         Ok(Self { producer, consumer })
     }
 
@@ -52,9 +50,9 @@ impl<T> Channel<T> {
     }
 }
 
-pub struct Producer<T>(EndPoint<T, WriteOp>);
+pub struct Producer<T>(Fifo<T, WriteOp>);
 
-pub struct Consumer<T>(EndPoint<T, ReadOp>);
+pub struct Consumer<T>(Fifo<T, ReadOp>);
 
 macro_rules! impl_common_methods_for_channel {
     () => {
@@ -107,78 +105,73 @@ macro_rules! impl_common_methods_for_channel {
 }
 
 impl<T> Producer<T> {
-    fn this_end(&self) -> &EndPointInner<HeapRbProducer<T>> {
+    fn this_end(&self) -> &FifoInner<HeapRbProducer<T>> {
         &self.0.common.producer
     }
 
-    fn peer_end(&self) -> &EndPointInner<HeapRbConsumer<T>> {
+    fn peer_end(&self) -> &FifoInner<HeapRbConsumer<T>> {
         &self.0.common.consumer
     }
 
     fn update_pollee(&self) {
+        // In theory, `rb.is_full()`/`rb.is_empty()`, where the `rb` is taken from either
+        // `this_end` or `peer_end`, should reflect the same state. However, we need to take the
+        // correct lock when updating the events to avoid races between the state check and the
+        // event update.
+
         let this_end = self.this_end();
-        let peer_end = self.peer_end();
-
-        // Update the event of pollee in a critical region so that pollee
-        // always reflects the _true_ state of the underlying ring buffer
-        // regardless of any race conditions.
-        let _guard = self.0.common.lock_event();
-
         let rb = this_end.rb();
-        if rb.is_full() {
+        if self.is_shutdown() || self.is_peer_shutdown() {
+            // The POLLOUT event is always set in this case. Don't try to remove it.
+        } else if rb.is_full() {
             this_end.pollee.del_events(IoEvents::OUT);
         }
+        drop(rb);
+
+        let peer_end = self.peer_end();
+        let rb = peer_end.rb();
         if !rb.is_empty() {
             peer_end.pollee.add_events(IoEvents::IN);
         }
+        drop(rb);
     }
 
     impl_common_methods_for_channel!();
 }
 
+impl<T> Pollable for Producer<T> {
+    fn poll(&self, mask: IoEvents, poller: Option<&Poller>) -> IoEvents {
+        self.poll(mask, poller)
+    }
+}
+
 impl<T: Copy> Producer<T> {
     pub fn write(&self, buf: &[T]) -> Result<usize> {
-        let is_nonblocking = self.is_nonblocking();
-
-        // Fast path
-        let res = self.try_write(buf);
-        if should_io_return(&res, is_nonblocking) {
-            return res;
-        }
-
-        // Slow path
-        let mask = IoEvents::OUT;
-        let poller = Poller::new();
-        loop {
-            let res = self.try_write(buf);
-            if should_io_return(&res, is_nonblocking) {
-                return res;
-            }
-            let events = self.poll(mask, Some(&poller));
-            if events.is_empty() {
-                // FIXME: should channel deal with timeout?
-                poller.wait()?;
-            }
+        if self.is_nonblocking() {
+            self.try_write(buf)
+        } else {
+            // The POLLOUT event is set after shutdown, so waiting for the single event is enough.
+            self.wait_events(IoEvents::OUT, || self.try_write(buf))
         }
     }
 
     fn try_write(&self, buf: &[T]) -> Result<usize> {
-        if self.is_shutdown() || self.is_peer_shutdown() {
-            return_errno!(Errno::EPIPE);
-        }
-
         if buf.is_empty() {
+            // Even after shutdown, writing an empty buffer is still fine.
             return Ok(0);
         }
 
-        let written_len = self.0.write(buf);
+        if self.is_shutdown() || self.is_peer_shutdown() {
+            return_errno_with_message!(Errno::EPIPE, "the channel is shut down");
+        }
 
+        let written_len = self.0.write(buf);
         self.update_pollee();
 
         if written_len > 0 {
             Ok(written_len)
         } else {
-            return_errno_with_message!(Errno::EAGAIN, "try write later");
+            return_errno_with_message!(Errno::EAGAIN, "the channel is full");
         }
     }
 }
@@ -189,46 +182,41 @@ impl<T> Producer<T> {
     /// On failure, this method returns `Err` containing
     /// the item fails to push.
     pub fn push(&self, item: T) -> core::result::Result<(), (Error, T)> {
-        let is_nonblocking = self.is_nonblocking();
-
-        // Fast path
-        let mut res = self.try_push(item);
-        if should_io_return(&res, is_nonblocking) {
-            return res;
+        if self.is_nonblocking() {
+            return self.try_push(item);
         }
 
-        // Slow path
-        let mask = IoEvents::OUT;
-        let poller = Poller::new();
-        loop {
-            let (_, item) = res.unwrap_err();
+        let mut stored_item = Some(item);
 
-            res = self.try_push(item);
-            if should_io_return(&res, is_nonblocking) {
-                return res;
-            }
-            let events = self.poll(mask, Some(&poller));
-            if events.is_empty() {
-                // FIXME: should channel deal with timeout?
-                if let Err(err) = poller.wait() {
-                    return Err((err, res.unwrap_err().1));
+        // The POLLOUT event is set after shutdown, so waiting for the single event is enough.
+        let result = self.wait_events(IoEvents::OUT, || {
+            match self.try_push(stored_item.take().unwrap()) {
+                Ok(()) => Ok(()),
+                Err((err, item)) => {
+                    stored_item = Some(item);
+                    Err(err)
                 }
             }
+        });
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => Err((err, stored_item.unwrap())),
         }
     }
 
     fn try_push(&self, item: T) -> core::result::Result<(), (Error, T)> {
         if self.is_shutdown() || self.is_peer_shutdown() {
-            let err = Error::with_message(Errno::EPIPE, "the pipe is shutdown");
+            let err = Error::with_message(Errno::EPIPE, "the channel is shut down");
             return Err((err, item));
         }
 
         self.0.push(item).map_err(|item| {
-            let err = Error::with_message(Errno::EAGAIN, "try push again");
+            let err = Error::with_message(Errno::EAGAIN, "the channel is full");
             (err, item)
         })?;
-
         self.update_pollee();
+
         Ok(())
     }
 }
@@ -237,139 +225,108 @@ impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
         self.shutdown();
 
-        let _guard = self.0.common.lock_event();
-
-        // When reading from a channel such as a pipe or a stream socket,
-        // POLLHUP merely indicates that the peer closed its end of the channel.
+        // The POLLHUP event indicates that the write end is shut down.
+        //
+        // No need to take a lock. There is no race because no one is modifying this particular event.
         self.peer_end().pollee.add_events(IoEvents::HUP);
     }
 }
 
 impl<T> Consumer<T> {
-    fn this_end(&self) -> &EndPointInner<HeapRbConsumer<T>> {
+    fn this_end(&self) -> &FifoInner<HeapRbConsumer<T>> {
         &self.0.common.consumer
     }
 
-    fn peer_end(&self) -> &EndPointInner<HeapRbProducer<T>> {
+    fn peer_end(&self) -> &FifoInner<HeapRbProducer<T>> {
         &self.0.common.producer
     }
 
     fn update_pollee(&self) {
+        // In theory, `rb.is_full()`/`rb.is_empty()`, where the `rb` is taken from either
+        // `this_end` or `peer_end`, should reflect the same state. However, we need to take the
+        // correct lock when updating the events to avoid races between the state check and the
+        // event update.
+
         let this_end = self.this_end();
-        let peer_end = self.peer_end();
-
-        // Update the event of pollee in a critical region so that pollee
-        // always reflects the _true_ state of the underlying ring buffer
-        // regardless of any race conditions.
-        let _guard = self.0.common.lock_event();
-
         let rb = this_end.rb();
         if rb.is_empty() {
             this_end.pollee.del_events(IoEvents::IN);
         }
+        drop(rb);
+
+        let peer_end = self.peer_end();
+        let rb = peer_end.rb();
         if !rb.is_full() {
             peer_end.pollee.add_events(IoEvents::OUT);
         }
+        drop(rb);
     }
 
     impl_common_methods_for_channel!();
 }
 
+impl<T> Pollable for Consumer<T> {
+    fn poll(&self, mask: IoEvents, poller: Option<&Poller>) -> IoEvents {
+        self.poll(mask, poller)
+    }
+}
+
 impl<T: Copy> Consumer<T> {
     pub fn read(&self, buf: &mut [T]) -> Result<usize> {
-        let is_nonblocking = self.is_nonblocking();
-
-        // Fast path
-        let res = self.try_read(buf);
-        if should_io_return(&res, is_nonblocking) {
-            return res;
-        }
-
-        // Slow path
-        let mask = IoEvents::IN;
-        let poller = Poller::new();
-        loop {
-            let res = self.try_read(buf);
-            if should_io_return(&res, is_nonblocking) {
-                return res;
-            }
-            let events = self.poll(mask, Some(&poller));
-            if events.is_empty() {
-                // FIXME: should channel have timeout?
-                poller.wait()?;
-            }
+        if self.is_nonblocking() {
+            self.try_read(buf)
+        } else {
+            // The POLLHUP event is in `IoEvents::ALWAYS_POLL`, which is not specified again.
+            self.wait_events(IoEvents::IN, || self.try_read(buf))
         }
     }
 
     fn try_read(&self, buf: &mut [T]) -> Result<usize> {
-        if self.is_shutdown() {
-            return_errno!(Errno::EPIPE);
-        }
         if buf.is_empty() {
             return Ok(0);
         }
 
+        // This must be recorded before the actual operation to avoid race conditions.
+        let is_shutdown = self.is_shutdown() || self.is_peer_shutdown();
+
         let read_len = self.0.read(buf);
-
         self.update_pollee();
-
-        if self.is_peer_shutdown() {
-            return Ok(read_len);
-        }
 
         if read_len > 0 {
             Ok(read_len)
+        } else if is_shutdown {
+            Ok(0)
         } else {
-            return_errno_with_message!(Errno::EAGAIN, "try read later");
+            return_errno_with_message!(Errno::EAGAIN, "the channel is empty");
         }
     }
 }
 
 impl<T> Consumer<T> {
-    /// Pops an item from the consumer
-    pub fn pop(&self) -> Result<T> {
-        let is_nonblocking = self.is_nonblocking();
-
-        // Fast path
-        let res = self.try_pop();
-        if should_io_return(&res, is_nonblocking) {
-            return res;
-        }
-
-        // Slow path
-        let mask = IoEvents::IN;
-        let poller = Poller::new();
-        loop {
-            let res = self.try_pop();
-            if should_io_return(&res, is_nonblocking) {
-                return res;
-            }
-            let events = self.poll(mask, Some(&poller));
-            if events.is_empty() {
-                // FIXME: should channel have timeout?
-                poller.wait()?;
-            }
+    /// Pops an item from the consumer.
+    pub fn pop(&self) -> Result<Option<T>> {
+        if self.is_nonblocking() {
+            self.try_pop()
+        } else {
+            // The POLLHUP event is in `IoEvents::ALWAYS_POLL`, which is not specified again.
+            self.wait_events(IoEvents::IN, || self.try_pop())
         }
     }
 
-    fn try_pop(&self) -> Result<T> {
-        if self.is_shutdown() {
-            return_errno_with_message!(Errno::EPIPE, "this end is shut down");
-        }
+    fn try_pop(&self) -> Result<Option<T>> {
+        // This must be recorded before the actual operation to avoid race conditions.
+        let is_shutdown = self.is_shutdown() || self.is_peer_shutdown();
 
         let item = self.0.pop();
-
         self.update_pollee();
 
         if let Some(item) = item {
-            return Ok(item);
+            Ok(Some(item))
+        } else if is_shutdown {
+            Ok(None)
+        } else {
+            return_errno_with_message!(Errno::EAGAIN, "the channel is empty")
         }
-
-        if self.is_peer_shutdown() {
-            return_errno_with_message!(Errno::EPIPE, "remote end is shut down");
-        }
-
-        return_errno_with_message!(Errno::EAGAIN, "try pop again")
     }
 }
 
@@ -377,26 +334,32 @@ impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         self.shutdown();
 
-        let _guard = self.0.common.lock_event();
-
-        // POLLERR is also set for a file descriptor referring to the write end of a pipe
-        // when the read end has been closed.
-        self.peer_end().pollee.add_events(IoEvents::ERR);
+        // The POLLERR event indicates that the read end is closed (so any subsequent writes will
+        // fail with an `EPIPE` error).
+        //
+        // The lock is taken because we are also adding the POLLOUT event, which may have races
+        // with the event updates triggered by the writer.
+        let peer_end = self.peer_end();
+        let _rb = peer_end.rb();
+        peer_end.pollee.add_events(IoEvents::ERR | IoEvents::OUT);
     }
 }
 
-struct EndPoint<T, R: TRights> {
+struct Fifo<T, R: TRights> {
     common: Arc<Common<T>>,
-    rights: R,
+    _rights: R,
 }
 
-impl<T, R: TRights> EndPoint<T, R> {
-    pub fn new(common: Arc<Common<T>>, rights: R) -> Self {
-        Self { common, rights }
+impl<T, R: TRights> Fifo<T, R> {
+    pub fn new(common: Arc<Common<T>>) -> Self {
+        Self {
+            common,
+            _rights: R::new(),
+        }
     }
 }
 
-impl<T: Copy, R: TRights> EndPoint<T, R> {
+impl<T: Copy, R: TRights> Fifo<T, R> {
     #[require(R > Read)]
     pub fn read(&self, buf: &mut [T]) -> usize {
         let mut rb = self.common.consumer.rb();
@@ -410,7 +373,7 @@ impl<T: Copy, R: TRights> EndPoint<T, R> {
     }
 }
 
-impl<T, R: TRights> EndPoint<T, R> {
+impl<T, R: TRights> Fifo<T, R> {
     /// Pushes an item into the endpoint.
     /// If the `push` method failes, this method will return
     /// `Err` containing the item that hasn't been pushed
@@ -429,9 +392,8 @@ impl<T, R: TRights> EndPoint<T, R> {
 }
 
 struct Common<T> {
-    producer: EndPointInner<HeapRbProducer<T>>,
-    consumer: EndPointInner<HeapRbConsumer<T>>,
-    event_lock: Mutex<()>,
+    producer: FifoInner<HeapRbProducer<T>>,
+    consumer: FifoInner<HeapRbConsumer<T>>,
 }
 
 impl<T> Common<T> {
@@ -439,25 +401,16 @@ impl<T> Common<T> {
         check_status_flags(flags)?;
 
         if capacity == 0 {
-            return_errno_with_message!(Errno::EINVAL, "capacity cannot be zero");
+            return_errno_with_message!(Errno::EINVAL, "the channel capacity cannot be zero");
         }
 
         let rb: HeapRb<T> = HeapRb::new(capacity);
         let (rb_producer, rb_consumer) = rb.split();
 
-        let producer = EndPointInner::new(rb_producer, IoEvents::OUT, flags);
-        let consumer = EndPointInner::new(rb_consumer, IoEvents::empty(), flags);
-        let event_lock = Mutex::new(());
+        let producer = FifoInner::new(rb_producer, IoEvents::OUT, flags);
+        let consumer = FifoInner::new(rb_consumer, IoEvents::empty(), flags);
 
-        Ok(Self {
-            producer,
-            consumer,
-            event_lock,
-        })
-    }
-
-    pub fn lock_event(&self) -> MutexGuard<()> {
-        self.event_lock.lock()
+        Ok(Self { producer, consumer })
     }
 
     pub fn capacity(&self) -> usize {
@@ -465,14 +418,14 @@ impl<T> Common<T> {
     }
 }
 
-struct EndPointInner<T> {
+struct FifoInner<T> {
     rb: Mutex<T>,
     pollee: Pollee,
     is_shutdown: AtomicBool,
     status_flags: AtomicU32,
 }
 
-impl<T> EndPointInner<T> {
+impl<T> FifoInner<T> {
     pub fn new(rb: T, init_events: IoEvents, status_flags: StatusFlags) -> Self {
         Self {
             rb: Mutex::new(rb),
@@ -508,42 +461,32 @@ impl<T> EndPointInner<T> {
 
 fn check_status_flags(flags: StatusFlags) -> Result<()> {
     let valid_flags: StatusFlags = StatusFlags::O_NONBLOCK | StatusFlags::O_DIRECT;
+
     if !valid_flags.contains(flags) {
-        return_errno_with_message!(Errno::EINVAL, "invalid flags");
+        // FIXME: Linux seems to silently ignore invalid flags. See
+        // <https://man7.org/linux/man-pages/man2/fcntl.2.html>.
+        return_errno_with_message!(Errno::EINVAL, "the flags are invalid");
     }
+
     if flags.contains(StatusFlags::O_DIRECT) {
-        return_errno_with_message!(Errno::EINVAL, "O_DIRECT is not supported");
+        return_errno_with_message!(Errno::EINVAL, "the `O_DIRECT` flag is not supported");
     }
+
     Ok(())
-}
-
-fn should_io_return<T, E: AsRef<Error>>(
-    res: &core::result::Result<T, E>,
-    is_nonblocking: bool,
-) -> bool {
-    if is_nonblocking {
-        return true;
-    }
-    match res {
-        Ok(_) => true,
-        Err(e) if e.as_ref().error() == Errno::EAGAIN => false,
-        Err(_) => true,
-    }
-}
-
-impl<T> AsRef<Error> for (Error, T) {
-    fn as_ref(&self) -> &Error {
-        &self.0
-    }
 }
 
 #[cfg(ktest)]
 mod test {
     use alloc::sync::Arc;
+    use core::sync::atomic;
 
-    use ostd::prelude::*;
+    use ostd::{prelude::*, sync::AtomicBits};
 
-    use crate::fs::utils::Channel;
+    use super::*;
+    use crate::thread::{
+        kernel_thread::{KernelThreadExt, ThreadOptions},
+        Thread,
+    };
 
     #[ktest]
     fn test_non_copy() {
@@ -561,8 +504,120 @@ mod test {
         }
 
         for _ in 0..3 {
-            let data = consumer.pop().unwrap();
+            let data = consumer.pop().unwrap().unwrap();
             assert_eq!(data, expected_data);
         }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Ordering {
+        ProduceThenConsume,
+        ConsumeThenProduce,
+    }
+
+    fn test_blocking<P, C>(produce: P, consume: C, ordering: Ordering)
+    where
+        P: Fn(Producer<u8>) + Sync + Send + 'static,
+        C: Fn(Consumer<u8>) + Sync + Send + 'static,
+    {
+        let channel = Channel::with_capacity(1).unwrap();
+        let (producer, consumer) = channel.split();
+
+        // FIXME: `ThreadOptions::new` currently accepts `Fn`, forcing us to use `SpinLock` to gain
+        // internal mutability. We should avoid this `SpinLock` by making `ThreadOptions::new`
+        // accept `FnOnce`.
+        let producer_with_lock = SpinLock::new(Some(producer));
+        let consumer_with_lock = SpinLock::new(Some(consumer));
+
+        let signal_producer = Arc::new(AtomicBool::new(false));
+        let signal_consumer = signal_producer.clone();
+
+        let producer = Thread::spawn_kernel_thread(ThreadOptions::new(move || {
+            let producer = producer_with_lock.lock().take().unwrap();
+
+            if ordering == Ordering::ConsumeThenProduce {
+                while !signal_producer.load(atomic::Ordering::Relaxed) {
+                    Thread::yield_now();
+                }
+            } else {
+                signal_producer.store(true, atomic::Ordering::Relaxed);
+            }
+
+            produce(producer);
+        }));
+
+        let consumer = Thread::spawn_kernel_thread(ThreadOptions::new(move || {
+            let consumer = consumer_with_lock.lock().take().unwrap();
+
+            if ordering == Ordering::ProduceThenConsume {
+                while !signal_consumer.load(atomic::Ordering::Relaxed) {
+                    Thread::yield_now();
+                }
+            } else {
+                signal_consumer.store(true, atomic::Ordering::Relaxed);
+            }
+
+            consume(consumer);
+        }));
+
+        producer.join();
+        consumer.join();
+    }
+
+    #[ktest]
+    fn test_read_empty() {
+        test_blocking(
+            |producer| {
+                assert_eq!(producer.write(&[1]).unwrap(), 1);
+            },
+            |consumer| {
+                let mut buf = [0; 1];
+                assert_eq!(consumer.read(&mut buf).unwrap(), 1);
+                assert_eq!(&buf, &[1]);
+            },
+            Ordering::ConsumeThenProduce,
+        );
+    }
+
+    #[ktest]
+    fn test_write_full() {
+        test_blocking(
+            |producer| {
+                assert_eq!(producer.write(&[1, 2]).unwrap(), 1);
+                assert_eq!(producer.write(&[2]).unwrap(), 1);
+            },
+            |consumer| {
+                let mut buf = [0; 2];
+                assert_eq!(consumer.read(&mut buf).unwrap(), 1);
+                assert_eq!(&buf[..1], &[1]);
+                assert_eq!(consumer.read(&mut buf).unwrap(), 1);
+                assert_eq!(&buf[..1], &[2]);
+            },
+            Ordering::ProduceThenConsume,
+        );
+    }
+
+    #[ktest]
+    fn test_read_closed() {
+        test_blocking(
+            |producer| drop(producer),
+            |consumer| {
+                let mut buf = [0; 1];
+                assert_eq!(consumer.read(&mut buf).unwrap(), 0);
+            },
+            Ordering::ConsumeThenProduce,
+        );
+    }
+
+    #[ktest]
+    fn test_write_closed() {
+        test_blocking(
+            |producer| {
+                assert_eq!(producer.write(&[1, 2]).unwrap(), 1);
+                assert_eq!(producer.write(&[2]).unwrap_err().error(), Errno::EPIPE);
+            },
+            |consumer| drop(consumer),
+            Ordering::ProduceThenConsume,
+        );
     }
 }
