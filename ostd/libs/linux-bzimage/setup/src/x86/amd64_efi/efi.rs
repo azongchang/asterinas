@@ -8,9 +8,9 @@ use uefi::{
 };
 
 use super::{
+    decoder::decompress_payload,
     paging::{Ia32eFlags, PageNumber, PageTableCreator},
     relocation::apply_rela_dyn_relocations,
-    decoder::decompress_payload,
 };
 
 // Suppress warnings since using todo!.
@@ -62,7 +62,7 @@ fn efi_phase_boot(
         _ => {
             uefi_services::println!("[EFI stub] Decompressing payload.");
             &decompress_payload(payload)
-        },
+        }
     };
 
     uefi_services::println!("[EFI stub] Loading payload.");

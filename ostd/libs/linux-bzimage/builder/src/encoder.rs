@@ -3,6 +3,7 @@
 //! This module is used to compress kernel ELF.
 
 use std::io::Write;
+
 use libflate::gzip::Encoder;
 
 pub fn compress_kernel(kernel: &[u8]) -> Vec<u8> {
