@@ -17,15 +17,15 @@ pub fn decompress_payload(payload: &[u8], magic: &[u8]) -> Vec<u8> {
         GZIP_MAGIC_NUMBER => {
             let mut decoder = gzip::Decoder::new(payload).unwrap();
             decoder.read_to_end(&mut kernel).unwrap();
-        },
+        }
         ZLIB_MAGIC_NUMBER => {
             let mut decoder = zlib::Decoder::new(payload).unwrap();
             decoder.read_to_end(&mut kernel).unwrap();
-        },
+        }
         _ => {
             let mut decoder = deflate::Decoder::new(payload);
             decoder.read_to_end(&mut kernel).unwrap();
-        },
+        }
     };
     kernel
 }
