@@ -14,14 +14,18 @@ pub mod unix_args;
 #[cfg(test)]
 mod test;
 
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, process};
 
-use scheme::{Action, ActionScheme, BootScheme, Build, GrubScheme, QemuScheme, Scheme};
+use scheme::{
+    Action, ActionScheme, BootProtocol, BootScheme, Build, GrubScheme, QemuScheme, Scheme,
+};
 
 use crate::{
     arch::{get_default_arch, Arch},
     cli::CommonArgs,
     config::unix_args::apply_kv_array,
+    error::Errno,
+    error_msg,
 };
 
 /// The global configuration for the OSDK actions.
@@ -79,6 +83,10 @@ fn apply_args_before_finalize(action_scheme: &mut ActionScheme, args: &CommonArg
 }
 
 fn apply_args_after_finalize(action: &mut Action, args: &CommonArgs) {
+    if action.grub.boot_protocol != BootProtocol::Linux && args.encoding.is_some() {
+        error_msg!("--encoding is not allowed to set");
+        process::exit(Errno::ParseMetadata as _);
+    }
     action.build.apply_common_args(args);
     action.qemu.apply_qemu_args(&args.qemu_args);
     if args.display_grub_menu {
