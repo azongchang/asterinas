@@ -13,6 +13,7 @@
 //! The setup code should be built into the ELF target and we convert it to a flat binary
 //! in the builder.
 
+mod encoder;
 mod mapping;
 mod pe_header;
 mod encoder;
@@ -23,6 +24,7 @@ use std::{
     path::Path,
 };
 
+use encoder::compress_kernel;
 use mapping::{SetupFileOffset, SetupVA};
 use xmas_elf::program::SegmentData;
 use encoder::compress_kernel;

@@ -4,13 +4,28 @@
 
 extern crate alloc;
 
-use core2::io::Read;
-use libflate::gzip::Decoder;
 pub use alloc::vec::Vec;
 
-pub fn decompress_payload(payload: &[u8]) -> Vec<u8> {
-    let mut decoder = Decoder::new(payload).unwrap();
+use core2::io::Read;
+use libflate::*;
+
+pub fn decompress_payload(payload: &[u8], magic: &[u8]) -> Vec<u8> {
     let mut kernel = Vec::new();
-    decoder.read_to_end(&mut kernel).unwrap();
+    const GZIP_MAGIC_NUMBER: &[u8] = &[0x1F, 0x8B];
+    const ZLIB_MAGIC_NUMBER: &[u8] = &[0x78, 0x9C];
+    match magic {
+        GZIP_MAGIC_NUMBER => {
+            let mut decoder = gzip::Decoder::new(payload).unwrap();
+            decoder.read_to_end(&mut kernel).unwrap();
+        }
+        ZLIB_MAGIC_NUMBER => {
+            let mut decoder = zlib::Decoder::new(payload).unwrap();
+            decoder.read_to_end(&mut kernel).unwrap();
+        }
+        _ => {
+            let mut decoder = deflate::Decoder::new(payload);
+            decoder.read_to_end(&mut kernel).unwrap();
+        }
+    };
     kernel
 }
