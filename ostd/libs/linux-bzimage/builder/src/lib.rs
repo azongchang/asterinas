@@ -16,7 +16,6 @@
 mod encoder;
 mod mapping;
 mod pe_header;
-mod encoder;
 
 use std::{
     fs::File,
@@ -27,7 +26,6 @@ use std::{
 use encoder::compress_kernel;
 use mapping::{SetupFileOffset, SetupVA};
 use xmas_elf::program::SegmentData;
-use encoder::compress_kernel;
 
 /// The type of the bzImage that we are building through `make_bzimage`.
 ///

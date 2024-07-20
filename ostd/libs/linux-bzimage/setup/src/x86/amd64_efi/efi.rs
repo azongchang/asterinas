@@ -11,7 +11,6 @@ use super::{
     decoder::decompress_payload,
     paging::{Ia32eFlags, PageNumber, PageTableCreator},
     relocation::apply_rela_dyn_relocations,
-    decoder::decompress_payload,
 };
 
 // Suppress warnings since using todo!.
