@@ -23,6 +23,8 @@ pub struct BuildScheme {
     pub linux_x86_legacy_boot: bool,
     #[serde(default)]
     pub strip_elf: bool,
+    #[serde(default)]
+    pub compression_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +40,8 @@ pub struct Build {
     pub linux_x86_legacy_boot: bool,
     #[serde(default)]
     pub strip_elf: bool,
+    #[serde(default)]
+    pub compression_format: String,
 }
 
 impl Default for Build {
@@ -49,6 +53,7 @@ impl Default for Build {
             override_configs: Vec::new(),
             linux_x86_legacy_boot: false,
             strip_elf: false,
+            compression_format: String::new(),
         }
     }
 }
@@ -71,6 +76,9 @@ impl Build {
         if common_args.strip_elf {
             self.strip_elf = true;
         }
+        if let Some(compression_format) = common_args.compression_format.clone() {
+            self.compression_format.clone_from(&compression_format);
+        }
     }
 }
 
@@ -91,6 +99,10 @@ impl BuildScheme {
         if parent.strip_elf {
             self.strip_elf = true;
         }
+        if self.compression_format.is_none() {
+            self.compression_format
+                .clone_from(&parent.compression_format);
+        }
     }
 
     pub fn finalize(self) -> Build {
@@ -101,6 +113,7 @@ impl BuildScheme {
             override_configs: Vec::new(),
             linux_x86_legacy_boot: self.linux_x86_legacy_boot,
             strip_elf: self.strip_elf,
+            compression_format: self.compression_format.unwrap_or_default(),
         }
     }
 }

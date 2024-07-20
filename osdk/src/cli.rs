@@ -358,4 +358,10 @@ pub struct CommonArgs {
         global = true
     )]
     pub qemu_args: Vec<String>,
+    #[arg(
+        long = "compression-format",
+        help = "Denote the compression format for kernel self-decompression",
+        global = true
+    )]
+    pub compression_format: Option<String>,
 }

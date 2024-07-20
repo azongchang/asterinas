@@ -11,6 +11,9 @@ protocol = "multiboot2"
 [qemu]
 args = "$(./tools/qemu_args.sh normal -ovmf)"
 
+[build]
+compression_format = "gzip"
+
 # Special options for running
 [run.boot]
 kcmd_args = [
