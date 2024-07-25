@@ -58,12 +58,11 @@ fn efi_phase_boot(
 
     let payload = unsafe { crate::get_payload(&*boot_params_ptr) };
     const ELF_MAGIC_NUMBER: &[u8] = &[0x7F, 0x45, 0x4C, 0x46];
-    let magic = &payload[0..4];
-    let kernel = match magic {
+    let kernel = match &payload[0..4] {
         ELF_MAGIC_NUMBER => payload,
         _ => {
             uefi_services::println!("[EFI stub] Decompressing payload.");
-            &decompress_payload(payload, &magic[..2])
+            &decompress_payload(payload)
         }
     };
 

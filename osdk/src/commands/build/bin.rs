@@ -164,7 +164,6 @@ fn install_setup_with_arch(
     // Remember to upgrade this version if new version of linux-bzimage-setup is released.
     const LINUX_BZIMAGE_SETUP_VERSION: &str = "0.1.0";
     cmd.arg("--version").arg(LINUX_BZIMAGE_SETUP_VERSION);
-    // cmd.arg("--tag").arg(crate::util::ASTER_GIT_TAG);
     cmd.arg("--target").arg(match arch {
         SetupInstallArch::X86_64 => "x86_64-unknown-none",
         SetupInstallArch::Other(path) => path.to_str().unwrap(),
