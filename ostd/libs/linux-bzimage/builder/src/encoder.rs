@@ -2,10 +2,7 @@
 
 //! This module is used to compress kernel ELF.
 
-use std::{
-    fs::read_to_string,
-    io::Write,
-};
+use std::{fs::read_to_string, io::Write};
 
 use libflate::{deflate, gzip, zlib};
 use serde::Deserialize;
