@@ -59,8 +59,6 @@ pub fn make_bzimage(
     setup.resize((setup.len() + 7) & !7, 0x00);
 
     let mut kernel = Vec::new();
-    println!("[issue-1020] kernel_path = {}", kernel_path.display());
-    println!("[issue-1020] kernel_path = {}", target_image_path.display());
     File::open(kernel_path)
         .unwrap()
         .read_to_end(&mut kernel)
