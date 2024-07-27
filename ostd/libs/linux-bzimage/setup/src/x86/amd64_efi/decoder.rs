@@ -9,8 +9,7 @@ pub use alloc::vec::Vec;
 use core2::io::Read;
 use libflate::{deflate, gzip, zlib};
 
-/// Checking the magic number of the payload and matching decompression methods to
-/// decompress it. 
+/// Checking the compression format and matching decompression methods to decompress payload. 
 pub fn decompress_payload(payload: &[u8]) -> Vec<u8> {
     let mut kernel = Vec::new();
     const GZIP_MAGIC_NUMBER: &[u8] = &[0x1F, 0x8B];

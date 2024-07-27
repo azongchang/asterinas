@@ -112,7 +112,7 @@ impl BuildScheme {
             override_configs: Vec::new(),
             linux_x86_legacy_boot: self.linux_x86_legacy_boot,
             strip_elf: self.strip_elf,
-            compression_format: self.compression_format.unwrap_or_else(|| "".to_string()),
+            compression_format: self.compression_format.unwrap_or_default(),
         }
     }
 }
