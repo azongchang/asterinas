@@ -100,7 +100,8 @@ impl BuildScheme {
             self.strip_elf = true;
         }
         if self.compression_format.is_none() {
-            self.compression_format.clone_from(&parent.compression_format);
+            self.compression_format
+                .clone_from(&parent.compression_format);
         }
     }
 
