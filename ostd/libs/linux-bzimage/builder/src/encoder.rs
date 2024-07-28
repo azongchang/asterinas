@@ -2,49 +2,67 @@
 
 //! This module is used to compress kernel ELF.
 
-use std::{fs::read_to_string, io::Write};
+use std::{
+    ffi::{OsStr, OsString},
+    io::Write,
+    str::FromStr,
+};
 
 use libflate::{deflate, gzip, zlib};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
-struct TomlManifest {
-    config: Config,
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionFormat {
+    #[default]
+    #[serde(rename = "plain")]
+    Plain,
+    #[serde(rename = "gzip")]
+    Gzip,
+    #[serde(rename = "zlib")]
+    Zlib,
+    #[serde(rename = "deflate")]
+    Deflate,
 }
 
-#[derive(Debug, Deserialize)]
-struct Config {
-    run: RunConfig,
+impl FromStr for CompressionFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "plain" => Ok(CompressionFormat::Plain),
+            "gzip" => Ok(CompressionFormat::Gzip),
+            "zlib" => Ok(CompressionFormat::Zlib),
+            "deflate" => Ok(CompressionFormat::Deflate),
+            _ => Err(format!("Invalid compression format: {}", s)),
+        }
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct RunConfig {
-    build: BuildConfig,
+impl From<OsString> for CompressionFormat {
+    fn from(os_string: OsString) -> Self {
+        CompressionFormat::from_str(&os_string.to_string_lossy()).unwrap_or_default()
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct BuildConfig {
-    compression_format: String,
+impl From<&OsStr> for CompressionFormat {
+    fn from(os_str: &OsStr) -> Self {
+        CompressionFormat::from_str(&os_str.to_string_lossy()).unwrap_or_default()
+    }
 }
 
-pub fn compress_kernel(kernel: &[u8]) -> Vec<u8> {
-    let mut current_dir = std::env::current_dir().unwrap();
-    current_dir.pop();
-    current_dir.push("asterinas/bundle.toml");
-    let toml_str = read_to_string(current_dir).unwrap();
-    let config: TomlManifest = toml::from_str(&toml_str).unwrap();
-    match config.config.run.build.compression_format {
-        typ if typ == "gzip" => {
+pub fn compress_kernel(kernel: &[u8], compression_format: CompressionFormat) -> Vec<u8> {
+    match compression_format {
+        CompressionFormat::Gzip => {
             let mut encoder = gzip::Encoder::new(Vec::new()).unwrap();
             encoder.write_all(kernel).unwrap();
             encoder.finish().into_result().unwrap()
         }
-        typ if typ == "zlib" => {
+        CompressionFormat::Zlib => {
             let mut encoder = zlib::Encoder::new(Vec::new()).unwrap();
             encoder.write_all(kernel).unwrap();
             encoder.finish().into_result().unwrap()
         }
-        typ if typ == "deflate" => {
+        CompressionFormat::Deflate => {
             let mut encoder = deflate::Encoder::new(Vec::new());
             encoder.write_all(kernel).unwrap();
             encoder.finish().into_result().unwrap()

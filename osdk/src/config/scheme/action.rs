@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use linux_bzimage_builder::CompressionFormat;
+
 use super::{inherit_optional, Boot, BootScheme, Grub, GrubScheme, Qemu, QemuScheme};
 
 use crate::{cli::CommonArgs, config::Arch};
@@ -23,8 +25,7 @@ pub struct BuildScheme {
     pub linux_x86_legacy_boot: bool,
     #[serde(default)]
     pub strip_elf: bool,
-    #[serde(default)]
-    pub compression_format: Option<String>,
+    pub compression_format: Option<CompressionFormat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,8 +41,7 @@ pub struct Build {
     pub linux_x86_legacy_boot: bool,
     #[serde(default)]
     pub strip_elf: bool,
-    #[serde(default)]
-    pub compression_format: String,
+    pub compression_format: CompressionFormat,
 }
 
 impl Default for Build {
@@ -53,7 +53,7 @@ impl Default for Build {
             override_configs: Vec::new(),
             linux_x86_legacy_boot: false,
             strip_elf: false,
-            compression_format: String::new(),
+            compression_format: CompressionFormat::default(),
         }
     }
 }

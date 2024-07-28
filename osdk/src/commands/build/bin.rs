@@ -7,7 +7,9 @@ use std::{
     process::Command,
 };
 
-use linux_bzimage_builder::{legacy32_rust_target_json, make_bzimage, BzImageType};
+use linux_bzimage_builder::{
+    legacy32_rust_target_json, make_bzimage, BzImageType, CompressionFormat,
+};
 
 use crate::{
     arch::Arch,
@@ -23,6 +25,7 @@ pub fn make_install_bzimage(
     target_dir: impl AsRef<Path>,
     aster_elf: &AsterBin,
     linux_x86_legacy_boot: bool,
+    compression_format: CompressionFormat,
 ) -> AsterBin {
     let target_name = get_current_crate_info().name;
     let image_type = if linux_x86_legacy_boot {
@@ -55,7 +58,13 @@ pub fn make_install_bzimage(
     let install_path = install_dir.as_ref().join(target_name);
     info!("Building bzImage");
     println!("install_path: {:?}", install_path);
-    make_bzimage(&install_path, image_type, aster_elf.path(), &setup_bin);
+    make_bzimage(
+        &install_path,
+        image_type,
+        aster_elf.path(),
+        &setup_bin,
+        compression_format,
+    );
 
     AsterBin::new(
         &install_path,
