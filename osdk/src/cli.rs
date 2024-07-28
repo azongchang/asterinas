@@ -17,6 +17,8 @@ use crate::{
     },
 };
 
+use linux_bzimage_builder::CompressionFormat;
+
 pub fn main() {
     let load_config = |common_args: &CommonArgs| {
         let manifest = TomlManifest::load();
@@ -360,8 +362,8 @@ pub struct CommonArgs {
     pub qemu_args: Vec<String>,
     #[arg(
         long = "compression-format",
-        help = "Denote the compression format",
+        help = "Denote the compression format for kernel self-decompression",
         global = true
     )]
-    pub compression_format: Option<String>,
+    pub compression_format: Option<CompressionFormat>,
 }

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use keyable_arc::KeyableWeak;
 
 use super::{connected::Connected, endpoint::Endpoint, UnixStreamSocket};
@@ -18,40 +16,23 @@ use crate::{
 
 pub(super) struct Listener {
     addr: UnixSocketAddrBound,
-    is_nonblocking: AtomicBool,
 }
 
 impl Listener {
-    pub(super) fn new(
-        addr: UnixSocketAddrBound,
-        backlog: usize,
-        nonblocking: bool,
-    ) -> Result<Self> {
+    pub(super) fn new(addr: UnixSocketAddrBound, backlog: usize) -> Result<Self> {
         BACKLOG_TABLE.add_backlog(&addr, backlog)?;
-        Ok(Self {
-            addr,
-            is_nonblocking: AtomicBool::new(nonblocking),
-        })
+        Ok(Self { addr })
     }
 
     pub(super) fn addr(&self) -> &UnixSocketAddrBound {
         &self.addr
     }
 
-    pub(super) fn is_nonblocking(&self) -> bool {
-        self.is_nonblocking.load(Ordering::Acquire)
-    }
-
-    pub(super) fn set_nonblocking(&self, is_nonblocking: bool) {
-        self.is_nonblocking.store(is_nonblocking, Ordering::Release);
-    }
-
-    pub(super) fn accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
+    pub(super) fn try_accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
         let addr = self.addr().clone();
-        let is_nonblocking = self.is_nonblocking();
 
         let connected = {
-            let local_endpoint = BACKLOG_TABLE.pop_incoming(is_nonblocking, &addr)?;
+            let local_endpoint = BACKLOG_TABLE.pop_incoming(&addr)?;
             Connected::new(local_endpoint)
         };
 
@@ -60,7 +41,7 @@ impl Listener {
             Some(addr) => SocketAddr::from(addr.clone()),
         };
 
-        let socket = Arc::new(UnixStreamSocket::new_connected(connected));
+        let socket = UnixStreamSocket::new_connected(connected, false);
 
         Ok((socket, peer_addr))
     }
@@ -118,36 +99,17 @@ impl BacklogTable {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "the socket is not listened"))
     }
 
-    fn pop_incoming(&self, nonblocking: bool, addr: &UnixSocketAddrBound) -> Result<Arc<Endpoint>> {
-        let mut poller = Poller::new();
-        loop {
-            let backlog = self.get_backlog(addr)?;
+    fn pop_incoming(&self, addr: &UnixSocketAddrBound) -> Result<Endpoint> {
+        let backlog = self.get_backlog(addr)?;
 
-            if let Some(endpoint) = backlog.pop_incoming() {
-                return Ok(endpoint);
-            }
-
-            if nonblocking {
-                return_errno_with_message!(Errno::EAGAIN, "no connection comes");
-            }
-
-            let events = {
-                let mask = IoEvents::IN;
-                backlog.poll(mask, Some(&mut poller))
-            };
-
-            if events.contains(IoEvents::ERR) | events.contains(IoEvents::HUP) {
-                return_errno_with_message!(Errno::ECONNABORTED, "connection is aborted");
-            }
-
-            // FIXME: deal with accept timeout
-            if events.is_empty() {
-                poller.wait()?;
-            }
+        if let Some(endpoint) = backlog.pop_incoming() {
+            Ok(endpoint)
+        } else {
+            return_errno_with_message!(Errno::EAGAIN, "no pending connection is available")
         }
     }
 
-    fn push_incoming(&self, addr: &UnixSocketAddrBound, endpoint: Arc<Endpoint>) -> Result<()> {
+    fn push_incoming(&self, addr: &UnixSocketAddrBound, endpoint: Endpoint) -> Result<()> {
         let backlog = self.get_backlog(addr).map_err(|_| {
             Error::with_message(
                 Errno::ECONNREFUSED,
@@ -171,7 +133,7 @@ impl BacklogTable {
 struct Backlog {
     pollee: Pollee,
     backlog: usize,
-    incoming_endpoints: Mutex<VecDeque<Arc<Endpoint>>>,
+    incoming_endpoints: Mutex<VecDeque<Endpoint>>,
 }
 
 impl Backlog {
@@ -183,7 +145,7 @@ impl Backlog {
         }
     }
 
-    fn push_incoming(&self, endpoint: Arc<Endpoint>) -> Result<()> {
+    fn push_incoming(&self, endpoint: Endpoint) -> Result<()> {
         let mut endpoints = self.incoming_endpoints.lock();
         if endpoints.len() >= self.backlog {
             return_errno_with_message!(Errno::ECONNREFUSED, "incoming_endpoints is full");
@@ -193,7 +155,7 @@ impl Backlog {
         Ok(())
     }
 
-    fn pop_incoming(&self) -> Option<Arc<Endpoint>> {
+    fn pop_incoming(&self) -> Option<Endpoint> {
         let mut incoming_endpoints = self.incoming_endpoints.lock();
         let endpoint = incoming_endpoints.pop_front();
         if incoming_endpoints.is_empty() {
@@ -218,9 +180,6 @@ pub(super) fn unregister_backlog(addr: &UnixSocketAddrBound) {
     BACKLOG_TABLE.remove_backlog(addr);
 }
 
-pub(super) fn push_incoming(
-    remote_addr: &UnixSocketAddrBound,
-    remote_end: Arc<Endpoint>,
-) -> Result<()> {
+pub(super) fn push_incoming(remote_addr: &UnixSocketAddrBound, remote_end: Endpoint) -> Result<()> {
     BACKLOG_TABLE.push_incoming(remote_addr, remote_end)
 }

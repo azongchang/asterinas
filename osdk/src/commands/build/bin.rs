@@ -7,9 +7,12 @@ use std::{
     process::Command,
 };
 
-use linux_bzimage_builder::{legacy32_rust_target_json, make_bzimage, BzImageType};
+use linux_bzimage_builder::{
+    legacy32_rust_target_json, make_bzimage, BzImageType, CompressionFormat,
+};
 
 use crate::{
+    arch::Arch,
     bundle::{
         bin::{AsterBin, AsterBinType, AsterBzImageMeta, AsterElfMeta},
         file::BundleFile,
@@ -22,6 +25,7 @@ pub fn make_install_bzimage(
     target_dir: impl AsRef<Path>,
     aster_elf: &AsterBin,
     linux_x86_legacy_boot: bool,
+    compression_format: CompressionFormat,
 ) -> AsterBin {
     let target_name = get_current_crate_info().name;
     let image_type = if linux_x86_legacy_boot {
@@ -54,10 +58,17 @@ pub fn make_install_bzimage(
     let install_path = install_dir.as_ref().join(target_name);
     info!("Building bzImage");
     println!("install_path: {:?}", install_path);
-    make_bzimage(&install_path, image_type, aster_elf.path(), &setup_bin);
+    make_bzimage(
+        &install_path,
+        image_type,
+        aster_elf.path(),
+        &setup_bin,
+        compression_format,
+    );
 
     AsterBin::new(
         &install_path,
+        aster_elf.arch(),
         AsterBinType::BzImage(AsterBzImageMeta {
             support_legacy32_boot: linux_x86_legacy_boot,
             support_efi_boot: false,
@@ -107,25 +118,28 @@ pub fn make_elf_for_qemu(install_dir: impl AsRef<Path>, elf: &AsterBin, strip: b
         std::fs::copy(elf.path(), &result_elf_path).unwrap();
     }
 
-    // Because QEMU denies a x86_64 multiboot ELF file (GRUB2 accept it, btw),
-    // modify `em_machine` to pretend to be an x86 (32-bit) ELF image,
-    //
-    // https://github.com/qemu/qemu/blob/950c4e6c94b15cd0d8b63891dddd7a8dbf458e6a/hw/i386/multiboot.c#L197
-    // Set EM_386 (0x0003) to em_machine.
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&result_elf_path)
-        .unwrap();
+    if elf.arch() == Arch::X86_64 {
+        // Because QEMU denies a x86_64 multiboot ELF file (GRUB2 accept it, btw),
+        // modify `em_machine` to pretend to be an x86 (32-bit) ELF image,
+        //
+        // https://github.com/qemu/qemu/blob/950c4e6c94b15cd0d8b63891dddd7a8dbf458e6a/hw/i386/multiboot.c#L197
+        // Set EM_386 (0x0003) to em_machine.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&result_elf_path)
+            .unwrap();
 
-    let bytes: [u8; 2] = [0x03, 0x00];
+        let bytes: [u8; 2] = [0x03, 0x00];
 
-    file.seek(SeekFrom::Start(18)).unwrap();
-    file.write_all(&bytes).unwrap();
-    file.flush().unwrap();
+        file.seek(SeekFrom::Start(18)).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+    }
 
     AsterBin::new(
         &result_elf_path,
+        elf.arch(),
         AsterBinType::Elf(AsterElfMeta {
             has_linux_header: false,
             has_pvh_header: false,
