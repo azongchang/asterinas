@@ -83,8 +83,8 @@ fn apply_args_before_finalize(action_scheme: &mut ActionScheme, args: &CommonArg
 }
 
 fn apply_args_after_finalize(action: &mut Action, args: &CommonArgs) {
-    if action.grub.boot_protocol != BootProtocol::Linux && args.compression_format.is_some() {
-        error_msg!("--compression-format is not allowed to set");
+    if action.grub.boot_protocol != BootProtocol::Linux && args.encoding.is_some() {
+        error_msg!("--encoding is not allowed to set");
         process::exit(Errno::ParseMetadata as _);
     }
     action.build.apply_common_args(args);

@@ -12,10 +12,10 @@ use libflate::{deflate, gzip, zlib};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CompressionFormat {
+pub enum PayloadEncoding {
     #[default]
-    #[serde(rename = "plain")]
-    Plain,
+    #[serde(rename = "raw")]
+    Raw,
     #[serde(rename = "gzip")]
     Gzip,
     #[serde(rename = "zlib")]
@@ -24,51 +24,49 @@ pub enum CompressionFormat {
     Deflate,
 }
 
-impl FromStr for CompressionFormat {
+impl FromStr for PayloadEncoding {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "plain" => Ok(CompressionFormat::Plain),
-            "gzip" => Ok(CompressionFormat::Gzip),
-            "zlib" => Ok(CompressionFormat::Zlib),
-            "deflate" => Ok(CompressionFormat::Deflate),
+            "raw" => Ok(Self::Raw),
+            "gzip" => Ok(Self::Gzip),
+            "zlib" => Ok(Self::Zlib),
+            "deflate" => Ok(Self::Deflate),
             _ => Err(format!("Invalid compression format: {}", s)),
         }
     }
 }
 
-impl From<OsString> for CompressionFormat {
+impl From<OsString> for PayloadEncoding {
     fn from(os_string: OsString) -> Self {
-        CompressionFormat::from_str(&os_string.to_string_lossy()).unwrap_or_default()
+        PayloadEncoding::from_str(&os_string.to_string_lossy()).unwrap_or_default()
     }
 }
 
-impl From<&OsStr> for CompressionFormat {
+impl From<&OsStr> for PayloadEncoding {
     fn from(os_str: &OsStr) -> Self {
-        CompressionFormat::from_str(&os_str.to_string_lossy()).unwrap_or_default()
+        PayloadEncoding::from_str(&os_str.to_string_lossy()).unwrap_or_default()
     }
 }
 
-pub fn compress_kernel(kernel: &[u8], compression_format: CompressionFormat) -> Vec<u8> {
-    match compression_format {
-        CompressionFormat::Gzip => {
+pub fn encode_kernel(kernel: Vec<u8>, encoding: PayloadEncoding) -> Vec<u8> {
+    match encoding {
+        PayloadEncoding::Raw => kernel,
+        PayloadEncoding::Gzip => {
             let mut encoder = gzip::Encoder::new(Vec::new()).unwrap();
-            encoder.write_all(kernel).unwrap();
+            encoder.write_all(&kernel).unwrap();
             encoder.finish().into_result().unwrap()
         }
-        CompressionFormat::Zlib => {
+        PayloadEncoding::Zlib => {
             let mut encoder = zlib::Encoder::new(Vec::new()).unwrap();
-            encoder.write_all(kernel).unwrap();
+            encoder.write_all(&kernel).unwrap();
             encoder.finish().into_result().unwrap()
         }
-        CompressionFormat::Deflate => {
+        PayloadEncoding::Deflate => {
             let mut encoder = deflate::Encoder::new(Vec::new());
-            encoder.write_all(kernel).unwrap();
+            encoder.write_all(&kernel).unwrap();
             encoder.finish().into_result().unwrap()
-        }
-        _ => {
-            panic!("Unsupported compression format!");
         }
     }
 }

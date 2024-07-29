@@ -8,7 +8,7 @@ use std::{
 };
 
 use linux_bzimage_builder::{
-    legacy32_rust_target_json, make_bzimage, BzImageType, CompressionFormat,
+    legacy32_rust_target_json, make_bzimage, BzImageType, PayloadEncoding,
 };
 
 use crate::{
@@ -25,7 +25,7 @@ pub fn make_install_bzimage(
     target_dir: impl AsRef<Path>,
     aster_elf: &AsterBin,
     linux_x86_legacy_boot: bool,
-    compression_format: CompressionFormat,
+    encoding: PayloadEncoding,
 ) -> AsterBin {
     let target_name = get_current_crate_info().name;
     let image_type = if linux_x86_legacy_boot {
@@ -63,7 +63,7 @@ pub fn make_install_bzimage(
         image_type,
         aster_elf.path(),
         &setup_bin,
-        compression_format,
+        encoding,
     );
 
     AsterBin::new(

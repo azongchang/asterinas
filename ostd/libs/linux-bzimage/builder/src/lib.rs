@@ -23,8 +23,8 @@ use std::{
     path::Path,
 };
 
-use encoder::compress_kernel;
-pub use encoder::CompressionFormat;
+use encoder::encode_kernel;
+pub use encoder::PayloadEncoding;
 use mapping::{SetupFileOffset, SetupVA};
 use xmas_elf::program::SegmentData;
 
@@ -42,14 +42,15 @@ pub enum BzImageType {
 ///  - `target_image_path`: The path to the target bzImage;
 ///  - `image_type`: The type of the bzImage that we are building;
 ///  - `kernel_path`: The path to the kernel ELF;
-///  - `setup_elf_path`: The path to the setup ELF.
+///  - `setup_elf_path`: The path to the setup ELF;
+///  - `compression_format`: The compression format for compressing the kernel ELF.
 ///
 pub fn make_bzimage(
     target_image_path: &Path,
     image_type: BzImageType,
     kernel_path: &Path,
     setup_elf_path: &Path,
-    compression_format: CompressionFormat,
+    encoding: PayloadEncoding,
 ) {
     let mut setup_elf = Vec::new();
     File::open(setup_elf_path)
@@ -67,7 +68,7 @@ pub fn make_bzimage(
         .unwrap();
     let payload = match image_type {
         BzImageType::Legacy32 => kernel,
-        BzImageType::Efi64 => compress_kernel(&kernel, compression_format),
+        BzImageType::Efi64 => encode_kernel(kernel, encoding),
     };
 
     let setup_len = setup.len();

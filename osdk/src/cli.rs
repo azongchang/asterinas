@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-use linux_bzimage_builder::CompressionFormat;
+use linux_bzimage_builder::PayloadEncoding;
 
 pub fn main() {
     let load_config = |common_args: &CommonArgs| {
@@ -361,9 +361,9 @@ pub struct CommonArgs {
     )]
     pub qemu_args: Vec<String>,
     #[arg(
-        long = "compression-format",
-        help = "Denote the compression format for kernel self-decompression",
+        long = "encoding",
+        help = "Denote the encoding format for kernel self-decompression",
         global = true
     )]
-    pub compression_format: Option<CompressionFormat>,
+    pub encoding: Option<PayloadEncoding>,
 }
