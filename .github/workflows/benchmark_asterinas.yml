@@ -2,9 +2,9 @@ name: Benchmark Asterinas
 on:
   # In case of manual trigger, use workflow_dispatch
   workflow_dispatch:
-  schedule:
+  # schedule:
     # Schedule to run on every day at 20:00 UTC (04:00 CST)
-    - cron: '0 20 * * *'
+    # - cron: '0 20 * * *'
 
 jobs:
   Benchmarks:
