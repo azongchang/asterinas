@@ -123,11 +123,19 @@ impl<M: PageMeta> Page<M> {
     ///
     /// # Safety
     ///
-    /// The physical address must represent a valid page and the caller must already hold one
-    /// reference count.
+    /// The physical address must represent a valid page.
+    ///
+    /// And the caller must ensure the metadata slot pointed through the corresponding
+    /// virtual address is initialized by holding a reference count of the page firstly.
+    /// Otherwise the function may add a reference count to an unused page.
     pub(in crate::mm) unsafe fn inc_ref_count(paddr: Paddr) {
-        let page = unsafe { ManuallyDrop::new(Self::from_raw(paddr)) };
-        let _page = page.clone();
+        debug_assert!(paddr % PAGE_SIZE == 0);
+        debug_assert!(paddr < MAX_PADDR.load(Ordering::Relaxed) as Paddr);
+        let vaddr: Vaddr = mapping::page_to_meta::<PagingConsts>(paddr);
+        // SAFETY: The virtual address points to an initialized metadata slot.
+        (*(vaddr as *const MetaSlot))
+            .ref_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the physical address.
@@ -229,11 +237,14 @@ impl DynPage {
     ///
     /// # Safety
     ///
-    /// The physical address must represent a valid page and the caller must already hold one
-    /// reference count.
+    /// This is the same as [`Page::inc_ref_count`].
     pub(in crate::mm) unsafe fn inc_ref_count(paddr: Paddr) {
-        let page = unsafe { ManuallyDrop::new(Self::from_raw(paddr)) };
-        let _page = page.clone();
+        debug_assert!(paddr % PAGE_SIZE == 0);
+        debug_assert!(paddr < MAX_PADDR.load(Ordering::Relaxed) as Paddr);
+        let vaddr: Vaddr = mapping::page_to_meta::<PagingConsts>(paddr);
+        (*(vaddr as *const MetaSlot))
+            .ref_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the physical address of the start of the page
