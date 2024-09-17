@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#define _GNU_SOURCE
+
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/poll.h>
+#include <sys/epoll.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stddef.h>
@@ -208,6 +212,62 @@ FN_TEST(getpeername)
 }
 END_TEST()
 
+FN_TEST(bind)
+{
+	TEST_ERRNO(bind(sk_bound, (struct sockaddr *)&UNIX_ADDR("\0Z"),
+			PATH_OFFSET + 1),
+		   EINVAL);
+
+	TEST_ERRNO(bind(sk_listen, (struct sockaddr *)&UNIX_ADDR("\0Z"),
+			PATH_OFFSET + 1),
+		   EINVAL);
+
+	TEST_SUCC(bind(sk_bound, (struct sockaddr *)&UNNAMED_ADDR,
+		       UNNAMED_ADDRLEN));
+
+	TEST_SUCC(bind(sk_listen, (struct sockaddr *)&UNNAMED_ADDR,
+		       UNNAMED_ADDRLEN));
+}
+END_TEST()
+
+FN_TEST(bind_connected)
+{
+	int fildes[2];
+	struct sockaddr_un addr;
+	socklen_t addrlen;
+
+	TEST_SUCC(socketpair(PF_UNIX, SOCK_STREAM, 0, fildes));
+
+	TEST_SUCC(bind(fildes[0], (struct sockaddr *)&UNIX_ADDR("\0X"),
+		       PATH_OFFSET + 2));
+	addrlen = sizeof(addr);
+	TEST_RES(getpeername(fildes[1], (struct sockaddr *)&addr, &addrlen),
+		 addrlen == PATH_OFFSET + 2 && memcmp(&addr, &UNIX_ADDR("\0X"),
+						      PATH_OFFSET + 2) == 0);
+
+	TEST_SUCC(bind(fildes[1], (struct sockaddr *)&UNIX_ADDR("\0Y"),
+		       PATH_OFFSET + 2));
+	addrlen = sizeof(addr);
+	TEST_RES(getpeername(fildes[0], (struct sockaddr *)&addr, &addrlen),
+		 addrlen == PATH_OFFSET + 2 && memcmp(&addr, &UNIX_ADDR("\0Y"),
+						      PATH_OFFSET + 2) == 0);
+
+	TEST_ERRNO(bind(fildes[0], (struct sockaddr *)&UNIX_ADDR("\0Z"),
+			PATH_OFFSET + 2),
+		   EINVAL);
+	TEST_ERRNO(bind(fildes[1], (struct sockaddr *)&UNIX_ADDR("\0Z"),
+			PATH_OFFSET + 2),
+		   EINVAL);
+	TEST_SUCC(bind(fildes[0], (struct sockaddr *)&UNNAMED_ADDR,
+		       UNNAMED_ADDRLEN));
+	TEST_SUCC(bind(fildes[1], (struct sockaddr *)&UNNAMED_ADDR,
+		       UNNAMED_ADDRLEN));
+
+	TEST_SUCC(close(fildes[0]));
+	TEST_SUCC(close(fildes[1]));
+}
+END_TEST()
+
 FN_TEST(connect)
 {
 	TEST_ERRNO(connect(sk_unbound, (struct sockaddr *)&BOUND_ADDR,
@@ -241,6 +301,103 @@ FN_TEST(listen)
 	TEST_ERRNO(listen(sk_connected, 10), EINVAL);
 
 	TEST_ERRNO(listen(sk_accepted, 10), EINVAL);
+}
+END_TEST()
+
+FN_TEST(accept)
+{
+	TEST_ERRNO(accept(sk_unbound, NULL, NULL), EINVAL);
+
+	TEST_ERRNO(accept(sk_bound, NULL, NULL), EINVAL);
+
+	TEST_ERRNO(accept(sk_connected, NULL, NULL), EINVAL);
+
+	TEST_ERRNO(accept(sk_accepted, NULL, NULL), EINVAL);
+}
+END_TEST()
+
+FN_TEST(send)
+{
+	char buf[1] = { 'z' };
+
+	TEST_ERRNO(send(sk_unbound, buf, 1, 0), ENOTCONN);
+
+	TEST_ERRNO(send(sk_bound, buf, 1, 0), ENOTCONN);
+
+	TEST_ERRNO(send(sk_listen, buf, 1, 0), ENOTCONN);
+}
+END_TEST()
+
+FN_TEST(recv)
+{
+	char buf[1] = { 'z' };
+
+	TEST_ERRNO(recv(sk_unbound, buf, 1, 0), EINVAL);
+
+	TEST_ERRNO(recv(sk_bound, buf, 1, 0), EINVAL);
+
+	TEST_ERRNO(recv(sk_listen, buf, 1, 0), EINVAL);
+}
+END_TEST()
+
+FN_TEST(blocking_connect)
+{
+	int i;
+	int sk, sks[4];
+	int pid;
+
+	// Setup
+
+	sk = TEST_SUCC(socket(PF_UNIX, SOCK_STREAM, 0));
+	TEST_SUCC(
+		bind(sk, (struct sockaddr *)&UNIX_ADDR("\0"), PATH_OFFSET + 1));
+	TEST_SUCC(listen(sk, 2));
+
+	for (i = 0; i < 3; ++i) {
+		sks[i] = TEST_SUCC(
+			socket(PF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0));
+		TEST_SUCC(connect(sks[i], (struct sockaddr *)&UNIX_ADDR("\0"),
+				  PATH_OFFSET + 1));
+	}
+
+#define MAKE_TEST(child, parent, errno)                                      \
+	sks[i] = TEST_SUCC(socket(PF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)); \
+	TEST_ERRNO(connect(sks[i], (struct sockaddr *)&UNIX_ADDR("\0"),      \
+			   PATH_OFFSET + 1),                                 \
+		   EAGAIN);                                                  \
+	TEST_SUCC(close(sks[i]));                                            \
+                                                                             \
+	pid = TEST_SUCC(fork());                                             \
+	if (pid == 0) {                                                      \
+		usleep(300 * 1000);                                          \
+		CHECK(child);                                                \
+		exit(0);                                                     \
+	}                                                                    \
+	TEST_SUCC(parent);                                                   \
+                                                                             \
+	sks[i] = TEST_SUCC(socket(PF_UNIX, SOCK_STREAM, 0));                 \
+	TEST_ERRNO(connect(sks[i], (struct sockaddr *)&UNIX_ADDR("\0"),      \
+			   PATH_OFFSET + 1),                                 \
+		   errno);                                                   \
+                                                                             \
+	TEST_SUCC(close(sks[i]));                                            \
+	TEST_SUCC(wait(NULL));
+
+	// Test 1: Accepting a connection resumes the blocked connection request
+	MAKE_TEST(accept(sk, NULL, NULL), 0, 0);
+
+	// Test 2: Resetting the backlog resumes the blocked connection request
+	MAKE_TEST(listen(sk, 3), 0, 0);
+
+	// Test 3: Closing the listener resumes the blocked connection request
+	MAKE_TEST(close(sk), close(sk), ECONNREFUSED);
+
+#undef MAKE_TEST
+
+	// Clean up
+
+	for (i = 0; i < 3; ++i)
+		TEST_SUCC(close(sks[i]));
 }
 END_TEST()
 
@@ -301,6 +458,183 @@ FN_TEST(ns_abs)
 		   ECONNREFUSED);
 	TEST_SUCC(bind(sk, (struct sockaddr *)&addr, addrlen));
 	TEST_SUCC(close(sk));
+}
+END_TEST()
+
+FN_TEST(shutdown_connected)
+{
+	int fildes[2];
+
+	TEST_SUCC(socketpair(PF_UNIX, SOCK_STREAM, 0, fildes));
+
+	TEST_SUCC(shutdown(fildes[0], SHUT_RD));
+	TEST_SUCC(shutdown(fildes[0], SHUT_WR));
+	TEST_SUCC(shutdown(fildes[0], SHUT_RDWR));
+
+	TEST_SUCC(shutdown(fildes[0], SHUT_RD));
+	TEST_SUCC(shutdown(fildes[0], SHUT_WR));
+	TEST_SUCC(shutdown(fildes[0], SHUT_RDWR));
+
+	TEST_SUCC(close(fildes[0]));
+	TEST_SUCC(close(fildes[1]));
+}
+END_TEST()
+
+FN_TEST(poll_unbound)
+{
+	int sk;
+	struct pollfd pfd = { .events = POLLIN | POLLOUT | POLLRDHUP };
+
+	sk = TEST_SUCC(socket(PF_UNIX, SOCK_STREAM, 0));
+	pfd.fd = sk;
+
+	TEST_RES(poll(&pfd, 1, 0), pfd.revents == (POLLOUT | POLLHUP));
+
+	TEST_SUCC(shutdown(sk, SHUT_WR));
+	TEST_RES(poll(&pfd, 1, 0), pfd.revents == (POLLOUT | POLLHUP));
+
+	TEST_SUCC(shutdown(sk, SHUT_RD));
+	TEST_RES(poll(&pfd, 1, 0),
+		 pfd.revents == (POLLIN | POLLOUT | POLLRDHUP | POLLHUP));
+
+	TEST_SUCC(
+		bind(sk, (struct sockaddr *)&UNIX_ADDR("\0"), PATH_OFFSET + 1));
+	TEST_SUCC(listen(sk, 10));
+
+	TEST_RES(poll(&pfd, 1, 0),
+		 pfd.revents == (POLLIN | POLLRDHUP | POLLHUP));
+
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
+FN_TEST(poll_listen)
+{
+	int sk;
+	struct pollfd pfd = { .events = POLLIN | POLLOUT | POLLRDHUP };
+
+	sk = TEST_SUCC(socket(PF_UNIX, SOCK_STREAM, 0));
+	pfd.fd = sk;
+
+	TEST_SUCC(
+		bind(sk, (struct sockaddr *)&UNIX_ADDR("\0"), PATH_OFFSET + 1));
+	TEST_SUCC(listen(sk, 10));
+
+	TEST_RES(poll(&pfd, 1, 0), pfd.revents == 0);
+
+	TEST_SUCC(shutdown(sk, SHUT_RD));
+	TEST_RES(poll(&pfd, 1, 0), pfd.revents == (POLLIN | POLLRDHUP));
+
+	TEST_SUCC(shutdown(sk, SHUT_WR));
+	TEST_RES(poll(&pfd, 1, 0),
+		 pfd.revents == (POLLIN | POLLRDHUP | POLLHUP));
+
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
+FN_TEST(poll_connected_close)
+{
+	int fildes[2];
+	struct pollfd pfd = { .events = POLLIN | POLLOUT | POLLRDHUP };
+
+	TEST_SUCC(socketpair(PF_UNIX, SOCK_STREAM, 0, fildes));
+
+	pfd.fd = fildes[1];
+	TEST_RES(poll(&pfd, 1, 0), pfd.revents == POLLOUT);
+
+	TEST_SUCC(close(fildes[0]));
+
+	pfd.fd = fildes[1];
+	TEST_RES(poll(&pfd, 1, 0),
+		 pfd.revents == (POLLIN | POLLOUT | POLLRDHUP | POLLHUP));
+
+	TEST_SUCC(close(fildes[1]));
+}
+END_TEST()
+
+FN_TEST(poll_connected_shutdown)
+{
+	int fildes[2];
+	struct pollfd pfd = { .events = POLLIN | POLLOUT | POLLRDHUP };
+
+#define MAKE_TEST(shut, ev1, ev2)                               \
+	TEST_SUCC(socketpair(PF_UNIX, SOCK_STREAM, 0, fildes)); \
+                                                                \
+	TEST_SUCC(shutdown(fildes[0], shut));                   \
+                                                                \
+	pfd.fd = fildes[0];                                     \
+	TEST_RES(poll(&pfd, 1, 0), pfd.revents == (ev1));       \
+                                                                \
+	pfd.fd = fildes[1];                                     \
+	TEST_RES(poll(&pfd, 1, 0), pfd.revents == (ev2));       \
+                                                                \
+	TEST_SUCC(close(fildes[0]));                            \
+	TEST_SUCC(close(fildes[1]));
+
+	MAKE_TEST(SHUT_RD, POLLIN | POLLOUT | POLLRDHUP, POLLOUT);
+
+	MAKE_TEST(SHUT_WR, POLLOUT, POLLIN | POLLOUT | POLLRDHUP);
+
+	MAKE_TEST(SHUT_RDWR, POLLIN | POLLOUT | POLLRDHUP | POLLHUP,
+		  POLLIN | POLLOUT | POLLRDHUP | POLLHUP);
+
+#undef MAKE_TEST
+}
+END_TEST()
+
+FN_TEST(epoll)
+{
+	int sk2_listen, sk2_connected, sk2_accepted;
+	int epfd_listen, epfd_connected;
+	struct epoll_event ev;
+
+	// Setup
+
+	sk2_listen = TEST_SUCC(socket(PF_UNIX, SOCK_STREAM, 0));
+	sk2_connected = TEST_SUCC(socket(PF_UNIX, SOCK_STREAM, 0));
+
+	epfd_listen = TEST_SUCC(epoll_create1(0));
+	ev.events = EPOLLIN;
+	ev.data.fd = sk2_listen;
+	TEST_SUCC(epoll_ctl(epfd_listen, EPOLL_CTL_ADD, sk2_listen, &ev));
+
+	epfd_connected = TEST_SUCC(epoll_create1(0));
+	ev.events = EPOLLIN;
+	ev.data.fd = sk2_connected;
+	TEST_SUCC(epoll_ctl(epfd_connected, EPOLL_CTL_ADD, sk2_connected, &ev));
+
+	// Test 1: Switch from the unbound state to the listening state
+
+	TEST_SUCC(bind(sk2_listen, (struct sockaddr *)&UNIX_ADDR("\0"),
+		       PATH_OFFSET + 1));
+	TEST_SUCC(listen(sk2_listen, 10));
+	TEST_RES(epoll_wait(epfd_listen, &ev, 1, 0), _ret == 0);
+
+	TEST_SUCC(connect(sk2_connected, (struct sockaddr *)&UNIX_ADDR("\0"),
+			  PATH_OFFSET + 1));
+	ev.data.fd = -1;
+	TEST_RES(epoll_wait(epfd_listen, &ev, 1, 0),
+		 _ret == 1 && ev.data.fd == sk2_listen);
+
+	// Test 2: Switch from the unbound state to the connected state
+
+	TEST_RES(epoll_wait(epfd_connected, &ev, 1, 0), _ret == 0);
+
+	sk2_accepted = TEST_SUCC(accept(sk2_listen, NULL, 0));
+	TEST_SUCC(write(sk2_accepted, "", 1));
+
+	ev.data.fd = -1;
+	TEST_RES(epoll_wait(epfd_connected, &ev, 1, 0),
+		 _ret == 1 && ev.data.fd == sk2_connected);
+
+	// Clean up
+
+	TEST_SUCC(close(epfd_listen));
+	TEST_SUCC(close(epfd_connected));
+	TEST_SUCC(close(sk2_connected));
+	TEST_SUCC(close(sk2_accepted));
+	TEST_SUCC(close(sk2_listen));
 }
 END_TEST()
 

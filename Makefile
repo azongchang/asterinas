@@ -57,7 +57,7 @@ endif
 
 # If the BENCHMARK is set, we will run the benchmark in the kernel mode.
 ifneq ($(BENCHMARK), none)
-CARGO_OSDK_ARGS += --init-args="/benchmark/common/runner.sh $(BENCHMARK)"
+CARGO_OSDK_ARGS += --init-args="/benchmark/common/bench_runner.sh $(BENCHMARK) asterinas"
 # TODO: remove this workaround after enabling kernel virtual area.
 OSTD_TASK_STACK_SIZE_IN_PAGES = 7
 endif
@@ -126,7 +126,8 @@ OSDK_CRATES := \
 	kernel/comps/network \
 	kernel/comps/time \
 	kernel/comps/virtio \
-	kernel/libs/aster-util
+	kernel/libs/aster-util \
+	kernel/libs/aster-bigtcp
 
 .PHONY: all
 all: build
@@ -168,7 +169,7 @@ tools:
 	@cd kernel/libs/comp-sys && cargo install --path cargo-component
 
 .PHONY: run
-run: build
+run: initramfs $(CARGO_OSDK)
 	@cargo osdk run $(CARGO_OSDK_ARGS)
 # Check the running status of auto tests from the QEMU log
 ifeq ($(AUTO_TEST), syscall)

@@ -98,12 +98,13 @@ impl InodeHandle_ {
             todo!("support write_at for FileIo");
         }
 
-        if self.status_flags().contains(StatusFlags::O_APPEND) {
+        let status_flags = self.status_flags();
+        if status_flags.contains(StatusFlags::O_APPEND) {
             // If the file has the O_APPEND flag, the offset is ignored
             offset = self.dentry.size();
         }
 
-        if self.status_flags().contains(StatusFlags::O_DIRECT) {
+        if status_flags.contains(StatusFlags::O_DIRECT) {
             self.dentry.inode().write_direct_at(offset, reader)
         } else {
             self.dentry.inode().write_at(offset, reader)
@@ -266,13 +267,16 @@ impl InodeHandle_ {
     }
 
     fn release_range_locks(&self) {
+        if self.dentry.inode().extension().is_none() {
+            return;
+        }
+
         let range_lock = RangeLockItemBuilder::new()
             .type_(RangeLockType::Unlock)
             .range(FileRange::new(0, OFFSET_MAX).unwrap())
             .build()
             .unwrap();
-
-        self.unlock_range_lock(&range_lock)
+        self.unlock_range_lock(&range_lock);
     }
 
     fn unlock_range_lock(&self, lock: &RangeLockItem) {

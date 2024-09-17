@@ -4,9 +4,10 @@ use super::{process_table, Pid, Process, TermStatus};
 use crate::{
     prelude::*,
     process::{
-        posix_thread::do_exit,
+        posix_thread::{do_exit, PosixThreadExt},
         signal::{constants::SIGCHLD, signals::kernel::KernelSignal},
     },
+    thread::Thread,
 };
 
 pub fn do_exit_group(term_status: TermStatus) {
@@ -18,9 +19,11 @@ pub fn do_exit_group(term_status: TermStatus) {
     current.set_zombie(term_status);
 
     // Exit all threads
-    let threads = current.threads().lock().clone();
-    for thread in threads {
-        if let Err(e) = do_exit(thread, term_status) {
+    let tasks = current.tasks().lock().clone();
+    for task in tasks {
+        let thread = Thread::borrow_from_task(&task);
+        let posix_thread = thread.as_posix_thread().unwrap();
+        if let Err(e) = do_exit(thread, posix_thread, term_status) {
             debug!("Ignore error when call exit: {:?}", e);
         }
     }
@@ -49,16 +52,17 @@ pub fn do_exit_group(term_status: TermStatus) {
             for (_, child_process) in current.children().lock().extract_if(|_, _| true) {
                 let mut parent = child_process.parent.lock();
                 init_children.insert(child_process.pid(), child_process.clone());
-                *parent = Arc::downgrade(&init_process);
+                parent.set_process(&init_process);
             }
         }
     }
 
-    if let Some(parent) = current.parent() {
+    let parent = current.parent().lock().process();
+    if let Some(parent) = parent.upgrade() {
         // Notify parent
         let signal = KernelSignal::new(SIGCHLD);
         parent.enqueue_signal(signal);
-        parent.children_pauser().resume_all();
+        parent.children_wait_queue().wake_all();
     }
 }
 

@@ -7,7 +7,7 @@ use super::{
 use crate::{
     prelude::*,
     process::{
-        posix_thread::PosixThreadExt,
+        posix_thread::{thread_table, PosixThreadExt},
         process_table,
         signal::{
             c_types::{sigevent_t, SigNotify},
@@ -17,10 +17,7 @@ use crate::{
         },
     },
     syscall::ClockId,
-    thread::{
-        thread_table,
-        work_queue::{submit_work_item, work_item::WorkItem},
-    },
+    thread::work_queue::{submit_work_item, work_item::WorkItem},
     time::{
         clockid_t,
         clocks::{BootTimeClock, MonotonicClock, RealTimeClock},

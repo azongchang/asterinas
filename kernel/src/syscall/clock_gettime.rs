@@ -7,8 +7,10 @@ use int_to_c_enum::TryFromInt;
 use super::SyscallReturn;
 use crate::{
     prelude::*,
-    process::{posix_thread::PosixThreadExt, process_table},
-    thread::thread_table,
+    process::{
+        posix_thread::{thread_table, PosixThreadExt},
+        process_table,
+    },
     time::{
         clockid_t,
         clocks::{

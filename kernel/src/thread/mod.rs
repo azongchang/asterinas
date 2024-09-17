@@ -2,7 +2,7 @@
 
 //! Posix thread implementation
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use ostd::task::Task;
 
@@ -13,20 +13,15 @@ pub mod exception;
 pub mod kernel_thread;
 pub mod status;
 pub mod task;
-pub mod thread_table;
 pub mod work_queue;
 
 pub type Tid = u32;
 
-static TID_ALLOCATOR: AtomicU32 = AtomicU32::new(0);
-
 /// A thread is a wrapper on top of task.
 pub struct Thread {
     // immutable part
-    /// Thread id
-    tid: Tid,
     /// Low-level info
-    task: Arc<Task>,
+    task: Weak<Task>,
     /// Data: Posix thread info/Kernel thread Info
     data: Box<dyn Send + Sync + Any>,
 
@@ -36,14 +31,8 @@ pub struct Thread {
 
 impl Thread {
     /// Never call these function directly
-    pub fn new(
-        tid: Tid,
-        task: Arc<Task>,
-        data: impl Send + Sync + Any,
-        status: ThreadStatus,
-    ) -> Self {
+    pub fn new(task: Weak<Task>, data: impl Send + Sync + Any, status: ThreadStatus) -> Self {
         Thread {
-            tid,
             task,
             data: Box::new(data),
             status: AtomicThreadStatus::new(status),
@@ -57,18 +46,23 @@ impl Thread {
     pub fn current() -> Option<Arc<Self>> {
         Task::current()?
             .data()
-            .downcast_ref::<Weak<Thread>>()?
-            .upgrade()
+            .downcast_ref::<Arc<Thread>>()
+            .cloned()
     }
 
-    pub(in crate::thread) fn task(&self) -> &Arc<Task> {
-        &self.task
+    /// Gets the Thread from task's data.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if the task is not a thread.
+    pub fn borrow_from_task(task: &Arc<Task>) -> &Arc<Self> {
+        task.data().downcast_ref::<Arc<Thread>>().unwrap()
     }
 
     /// Runs this thread at once.
     pub fn run(&self) {
         self.set_status(ThreadStatus::Running);
-        self.task.run();
+        self.task.upgrade().unwrap().run();
     }
 
     pub(super) fn exit(&self) {
@@ -94,10 +88,6 @@ impl Thread {
         Task::yield_now()
     }
 
-    pub fn tid(&self) -> Tid {
-        self.tid
-    }
-
     /// Returns the associated data.
     ///
     /// The return type must be borrowed box, otherwise the `downcast_ref` will fail.
@@ -105,9 +95,4 @@ impl Thread {
     pub fn data(&self) -> &Box<dyn Send + Sync + Any> {
         &self.data
     }
-}
-
-/// Allocates a new tid for the new thread
-pub fn allocate_tid() -> Tid {
-    TID_ALLOCATOR.fetch_add(1, Ordering::SeqCst)
 }

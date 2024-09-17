@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::Ordering;
+
 use self::timer_manager::PosixTimerManager;
 use super::{
-    posix_thread::PosixThreadExt,
+    posix_thread::{allocate_posix_tid, PosixThreadExt},
     process_table,
     process_vm::{Heap, InitStackReader, ProcessVm},
     rlimit::ResourceLimits,
     signal::{
-        constants::SIGCHLD,
         sig_disposition::SigDispositions,
         sig_num::{AtomicSigNum, SigNum},
         signals::Signal,
-        Pauser,
     },
     status::ProcessStatus,
     Credentials, TermStatus,
@@ -21,7 +21,7 @@ use crate::{
     fs::{file_table::FileTable, fs_resolver::FsResolver, utils::FileCreationMask},
     prelude::*,
     sched::nice::Nice,
-    thread::{allocate_tid, Thread},
+    thread::Thread,
     time::clocks::ProfClock,
     vm::vmar::Vmar,
 };
@@ -37,6 +37,7 @@ use aster_rights::Full;
 use atomic::Atomic;
 pub use builder::ProcessBuilder;
 pub use job_control::JobControl;
+use ostd::{sync::WaitQueue, task::Task};
 pub use process_group::ProcessGroup;
 pub use session::Session;
 pub use terminal::Terminal;
@@ -61,23 +62,23 @@ pub struct Process {
 
     process_vm: ProcessVm,
     /// Wait for child status changed
-    children_pauser: Arc<Pauser>,
+    children_wait_queue: WaitQueue,
 
     // Mutable Part
     /// The executable path.
     executable_path: RwLock<String>,
     /// The threads
-    threads: Mutex<Vec<Arc<Thread>>>,
+    tasks: Mutex<Vec<Arc<Task>>>,
     /// Process status
     status: ProcessStatus,
     /// Parent process
-    pub(super) parent: Mutex<Weak<Process>>,
+    pub(super) parent: ParentProcess,
     /// Children processes
     children: Mutex<BTreeMap<Pid, Arc<Process>>>,
     /// Process group
     pub(super) process_group: Mutex<Weak<ProcessGroup>>,
     /// File table
-    file_table: Arc<Mutex<FileTable>>,
+    file_table: Arc<SpinLock<FileTable>>,
     /// FsResolver
     fs: Arc<RwMutex<FsResolver>>,
     /// umask
@@ -102,6 +103,63 @@ pub struct Process {
     timer_manager: PosixTimerManager,
 }
 
+/// Representing a parent process by holding a weak reference to it and its PID.
+///
+/// This type caches the value of the PID so that it can be retrieved cheaply.
+///
+/// The benefit of using `ParentProcess` over `(Mutex<Weak<Process>>, Atomic<Pid>,)` is to
+/// enforce the invariant that the cached PID and the weak reference are always kept in sync.
+pub struct ParentProcess {
+    process: Mutex<Weak<Process>>,
+    pid: Atomic<Pid>,
+}
+
+impl ParentProcess {
+    pub fn new(process: Weak<Process>) -> Self {
+        let pid = match process.upgrade() {
+            Some(process) => process.pid(),
+            None => 0,
+        };
+
+        Self {
+            process: Mutex::new(process),
+            pid: Atomic::new(pid),
+        }
+    }
+
+    pub fn pid(&self) -> Pid {
+        self.pid.load(Ordering::Relaxed)
+    }
+
+    pub fn lock(&self) -> ParentProcessGuard<'_> {
+        ParentProcessGuard {
+            guard: self.process.lock(),
+            this: self,
+        }
+    }
+}
+
+pub struct ParentProcessGuard<'a> {
+    guard: MutexGuard<'a, Weak<Process>>,
+    this: &'a ParentProcess,
+}
+
+impl ParentProcessGuard<'_> {
+    pub fn process(&self) -> Weak<Process> {
+        self.guard.clone()
+    }
+
+    pub fn pid(&self) -> Pid {
+        self.this.pid()
+    }
+
+    /// Update both pid and weak ref.
+    pub fn set_process(&mut self, new_process: &Arc<Process>) {
+        self.this.pid.store(new_process.pid(), Ordering::Relaxed);
+        *self.guard = Arc::downgrade(new_process);
+    }
+}
+
 impl Process {
     /// Returns the current process.
     ///
@@ -109,19 +167,25 @@ impl Process {
     ///  - the function is called in the bootstrap context;
     ///  - or if the current task is not associated with a process.
     pub fn current() -> Option<Arc<Process>> {
-        Some(Thread::current()?.as_posix_thread()?.process())
+        Some(
+            Task::current()?
+                .data()
+                .downcast_ref::<Arc<Thread>>()?
+                .as_posix_thread()?
+                .process(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn new(
         pid: Pid,
         parent: Weak<Process>,
-        threads: Vec<Arc<Thread>>,
+        tasks: Vec<Arc<Task>>,
         executable_path: String,
         process_vm: ProcessVm,
 
         fs: Arc<RwMutex<FsResolver>>,
-        file_table: Arc<Mutex<FileTable>>,
+        file_table: Arc<SpinLock<FileTable>>,
 
         umask: Arc<RwLock<FileCreationMask>>,
         resource_limits: ResourceLimits,
@@ -130,18 +194,18 @@ impl Process {
     ) -> Arc<Self> {
         // SIGCHID does not interrupt pauser. Child process will
         // resume paused parent when doing exit.
-        let children_pauser = Pauser::new_with_mask(SIGCHLD.into());
+        let children_wait_queue = WaitQueue::new();
 
         let prof_clock = ProfClock::new();
 
         Arc::new_cyclic(|process_ref: &Weak<Process>| Self {
             pid,
-            threads: Mutex::new(threads),
+            tasks: Mutex::new(tasks),
             executable_path: RwLock::new(executable_path),
             process_vm,
-            children_pauser,
+            children_wait_queue,
             status: ProcessStatus::new_uninit(),
-            parent: Mutex::new(parent),
+            parent: ParentProcess::new(parent),
             children: Mutex::new(BTreeMap::new()),
             process_group: Mutex::new(Weak::new()),
             file_table,
@@ -178,7 +242,7 @@ impl Process {
         envp: Vec<CString>,
     ) -> Result<Arc<Self>> {
         let process_builder = {
-            let pid = allocate_tid();
+            let pid = allocate_posix_tid();
             let parent = Weak::new();
 
             let credentials = Credentials::new_root();
@@ -213,13 +277,14 @@ impl Process {
 
     /// start to run current process
     pub fn run(&self) {
-        let threads = self.threads.lock();
+        let tasks = self.tasks.lock();
         // when run the process, the process should has only one thread
-        debug_assert!(threads.len() == 1);
+        debug_assert!(tasks.len() == 1);
         debug_assert!(self.is_runnable());
-        let thread = threads[0].clone();
+        let task = tasks[0].clone();
         // should not hold the lock when run thread
-        drop(threads);
+        drop(tasks);
+        let thread = Thread::borrow_from_task(&task);
         thread.run();
     }
 
@@ -239,8 +304,8 @@ impl Process {
         &self.timer_manager
     }
 
-    pub fn threads(&self) -> &Mutex<Vec<Arc<Thread>>> {
-        &self.threads
+    pub fn tasks(&self) -> &Mutex<Vec<Arc<Task>>> {
+        &self.tasks
     }
 
     pub fn executable_path(&self) -> String {
@@ -260,20 +325,21 @@ impl Process {
     }
 
     pub fn main_thread(&self) -> Option<Arc<Thread>> {
-        self.threads
+        self.tasks
             .lock()
             .iter()
-            .find(|thread| thread.tid() == self.pid)
+            .find(|task| task.tid() == self.pid)
+            .map(Thread::borrow_from_task)
             .cloned()
     }
 
     // *********** Parent and child ***********
-    pub fn parent(&self) -> Option<Arc<Process>> {
-        self.parent.lock().upgrade()
+    pub fn parent(&self) -> &ParentProcess {
+        &self.parent
     }
 
     pub fn is_init_process(&self) -> bool {
-        self.parent().is_none()
+        self.parent.lock().process().upgrade().is_none()
     }
 
     pub(super) fn children(&self) -> &Mutex<BTreeMap<Pid, Arc<Process>>> {
@@ -284,8 +350,8 @@ impl Process {
         self.children.lock().contains_key(pid)
     }
 
-    pub fn children_pauser(&self) -> &Arc<Pauser> {
-        &self.children_pauser
+    pub fn children_wait_queue(&self) -> &WaitQueue {
+        &self.children_wait_queue
     }
 
     // *********** Process group & Session***********
@@ -552,7 +618,7 @@ impl Process {
 
     // ************** File system ****************
 
-    pub fn file_table(&self) -> &Arc<Mutex<FileTable>> {
+    pub fn file_table(&self) -> &Arc<SpinLock<FileTable>> {
         &self.file_table
     }
 
@@ -586,7 +652,7 @@ impl Process {
         // TODO: check that the signal is not user signal
 
         // Enqueue signal to the first thread that does not block the signal
-        let threads = self.threads.lock();
+        let threads = self.tasks.lock();
         for thread in threads.iter() {
             let posix_thread = thread.as_posix_thread().unwrap();
             if !posix_thread.has_signal_blocked(signal.num()) {
@@ -652,7 +718,7 @@ mod test {
     fn new_process(parent: Option<Arc<Process>>) -> Arc<Process> {
         crate::util::random::init();
         crate::fs::rootfs::init_root_mount();
-        let pid = allocate_tid();
+        let pid = allocate_posix_tid();
         let parent = if let Some(parent) = parent {
             Arc::downgrade(&parent)
         } else {
@@ -665,7 +731,7 @@ mod test {
             String::new(),
             ProcessVm::alloc(),
             Arc::new(RwMutex::new(FsResolver::new())),
-            Arc::new(Mutex::new(FileTable::new())),
+            Arc::new(SpinLock::new(FileTable::new())),
             Arc::new(RwLock::new(FileCreationMask::default())),
             ResourceLimits::default(),
             Nice::default(),

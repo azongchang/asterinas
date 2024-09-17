@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{futex::futex_wake, robust_list::wake_robust_futex, PosixThread, PosixThreadExt};
+use super::{futex::futex_wake, robust_list::wake_robust_futex, thread_table, PosixThread};
 use crate::{
     prelude::*,
     process::{do_exit_group, TermStatus},
-    thread::{thread_table, Thread, Tid},
+    thread::{Thread, Tid},
 };
 
 /// Exits the thread if the thread is a POSIX thread.
@@ -12,15 +12,13 @@ use crate::{
 /// # Panics
 ///
 /// If the thread is not a POSIX thread, this method will panic.
-pub fn do_exit(thread: Arc<Thread>, term_status: TermStatus) -> Result<()> {
+pub fn do_exit(thread: &Thread, posix_thread: &PosixThread, term_status: TermStatus) -> Result<()> {
     if thread.status().is_exited() {
         return Ok(());
     }
     thread.exit();
 
-    let tid = thread.tid();
-
-    let posix_thread = thread.as_posix_thread().unwrap();
+    let tid = posix_thread.tid;
 
     let mut clear_ctid = posix_thread.clear_child_tid().lock();
     // If clear_ctid !=0 ,do a futex wake and write zero to the clear_ctid addr.

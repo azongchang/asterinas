@@ -7,14 +7,13 @@ use crate::{
     fs::{file_table::FileTable, fs_resolver::FsResolver, utils::FileCreationMask},
     prelude::*,
     process::{
-        posix_thread::{PosixThreadBuilder, PosixThreadExt},
+        posix_thread::{create_posix_task_from_executable, PosixThreadBuilder},
         process_vm::ProcessVm,
         rlimit::ResourceLimits,
         signal::sig_disposition::SigDispositions,
         Credentials,
     },
     sched::nice::Nice,
-    thread::Thread,
 };
 
 pub struct ProcessBuilder<'a> {
@@ -28,7 +27,7 @@ pub struct ProcessBuilder<'a> {
     argv: Option<Vec<CString>>,
     envp: Option<Vec<CString>>,
     process_vm: Option<ProcessVm>,
-    file_table: Option<Arc<Mutex<FileTable>>>,
+    file_table: Option<Arc<SpinLock<FileTable>>>,
     fs: Option<Arc<RwMutex<FsResolver>>>,
     umask: Option<Arc<RwLock<FileCreationMask>>>,
     resource_limits: Option<ResourceLimits>,
@@ -67,7 +66,7 @@ impl<'a> ProcessBuilder<'a> {
         self
     }
 
-    pub fn file_table(&mut self, file_table: Arc<Mutex<FileTable>>) -> &mut Self {
+    pub fn file_table(&mut self, file_table: Arc<SpinLock<FileTable>>) -> &mut Self {
         self.file_table = Some(file_table);
         self
     }
@@ -152,7 +151,7 @@ impl<'a> ProcessBuilder<'a> {
         let process_vm = process_vm.or_else(|| Some(ProcessVm::alloc())).unwrap();
 
         let file_table = file_table
-            .or_else(|| Some(Arc::new(Mutex::new(FileTable::new_with_stdio()))))
+            .or_else(|| Some(Arc::new(SpinLock::new(FileTable::new_with_stdio()))))
             .unwrap();
 
         let fs = fs
@@ -190,11 +189,11 @@ impl<'a> ProcessBuilder<'a> {
             )
         };
 
-        let thread = if let Some(thread_builder) = main_thread_builder {
+        let task = if let Some(thread_builder) = main_thread_builder {
             let builder = thread_builder.process(Arc::downgrade(&process));
             builder.build()
         } else {
-            Thread::new_posix_thread_from_executable(
+            create_posix_task_from_executable(
                 pid,
                 credentials.unwrap(),
                 process.vm(),
@@ -206,7 +205,7 @@ impl<'a> ProcessBuilder<'a> {
             )?
         };
 
-        process.threads().lock().push(thread);
+        process.tasks().lock().push(task);
 
         process.set_runnable();
 

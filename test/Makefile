@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MPL-2.0
 
+BINARY_CACHE_DIR := /opt/linux_binary_cache
 VDSO_DIR := ../target
 VDSO_LIB := $(VDSO_DIR)/vdso64.so
 MKFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
@@ -7,7 +8,6 @@ CUR_DIR := $(patsubst %/,%,$(dir $(MKFILE_PATH)))
 ATOMIC_WGET := $(CUR_DIR)/../tools/atomic_wget.sh
 BUILD_DIR := $(CUR_DIR)/build
 INITRAMFS := $(BUILD_DIR)/initramfs
-BENCHMARK_ENTRYPOINT := $(CUR_DIR)/benchmark/benchmark_entrypoint.sh
 INITRAMFS_FILELIST := $(BUILD_DIR)/initramfs.filelist
 INITRAMFS_IMAGE := $(BUILD_DIR)/initramfs.cpio.gz
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
@@ -27,6 +27,7 @@ INITRAMFS_ALL_DIRS := \
 	$(INITRAMFS)/bin \
 	$(INITRAMFS)/sbin \
 	$(INITRAMFS)/usr/bin \
+	$(INITRAMFS)/usr/local \
 	$(INITRAMFS)/test \
 	$(INITRAMFS)/benchmark \
 	$(INITRAMFS_EMPTY_DIRS)
@@ -58,24 +59,29 @@ $(INITRAMFS)/lib/x86_64-linux-gnu: | $(VDSO_LIB)
 	@cp -L /lib/x86_64-linux-gnu/libkrb5support.so.0 $@
 	@cp -L /lib/x86_64-linux-gnu/libkeyutils.so.1 $@
 	@cp -L /lib/x86_64-linux-gnu/libresolv.so.2 $@
+	@# required for LevelDB-db_bench_sqlite3
+	@cp -L /lib/x86_64-linux-gnu/libsqlite3.so $@
 	@# required for VDSO
 	@cp -L $(VDSO_LIB) $@
 
-$(VDSO_LIB): | $(VDSO_DIR)
+$(VDSO_LIB): | $(VDSO_DIR) $(BINARY_CACHE_DIR)/vdso64.so
 	@# TODO: use a custom compiled vdso.so file in the future.
-	$(ATOMIC_WGET) $@ "https://raw.githubusercontent.com/asterinas/linux_vdso/2a6d2db/vdso64.so"
+	@cp $(BINARY_CACHE_DIR)/vdso64.so $@
 	
 $(VDSO_DIR):
 	@mkdir -p $@
 	
+$(BINARY_CACHE_DIR)/vdso64.so:
+	@mkdir -p $(BINARY_CACHE_DIR)
+	@$(ATOMIC_WGET) $@ "https://raw.githubusercontent.com/asterinas/linux_vdso/2a6d2db/vdso64.so"
+
 $(INITRAMFS)/lib64:
 	@mkdir -p $@
 	@cp -L /lib64/ld-linux-x86-64.so.2 $@
 
 $(INITRAMFS)/etc:
 	@mkdir -p $@
-	@cp $(CUR_DIR)/etc/passwd $@
-	@cp $(CUR_DIR)/etc/group $@
+	@cp $(CUR_DIR)/etc/* $@
 
 # Install busybox into /bin and /usr/bin.
 $(INITRAMFS)/bin:
@@ -91,15 +97,17 @@ $(INITRAMFS)/usr/bin: | $(INITRAMFS)/bin
 	@mkdir -p $@
 	@cp /usr/bin/busybox $@
 
+$(INITRAMFS)/usr/local:
+	@mkdir -p $@
+	@cp -r /usr/local/nginx $@
+	@cp -r /usr/local/redis $@
+
 .PHONY: $(INITRAMFS)/test
 $(INITRAMFS)/test:
 	@make --no-print-directory -C apps
 
 $(INITRAMFS)/benchmark: | $(INITRAMFS)/benchmark/bin
 	@cp -rf $(CUR_DIR)/benchmark/* $@
-	@if [ -e $(BENCHMARK_ENTRYPOINT) ]; then \
-		cp $(BENCHMARK_ENTRYPOINT) $@; \
-	fi
 
 $(INITRAMFS)/benchmark/bin:
 	@mkdir -p $@
@@ -110,6 +118,10 @@ $(INITRAMFS)/benchmark/bin:
 	@cp -r /usr/local/benchmark/unixbench $@
 	@cp -r /usr/local/benchmark/lmbench $@
 	@cp /usr/local/benchmark/fio/bin/fio $@
+	@cp /usr/local/benchmark/sqlite-speedtest1 $@
+	@cp /usr/local/leveldb/benchmark/db_bench $@
+	@mv $@/db_bench $@/db_bench_leveldb
+	@cp /usr/local/leveldb/benchmark/db_bench_sqlite3 $@
 
 # Make necessary directories.
 $(INITRAMFS_EMPTY_DIRS):

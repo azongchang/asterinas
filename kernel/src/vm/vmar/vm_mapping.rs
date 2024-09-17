@@ -167,16 +167,6 @@ impl VmMapping {
         self.vmo.as_ref()
     }
 
-    /// Adds a new committed page and map it to vmspace. If copy on write is set, it's allowed to unmap the page at the same address.
-    /// FIXME: This implementation based on the truth that we map one page at a time. If multiple pages are mapped together, this implementation may have problems
-    fn map_one_page(&self, map_addr: usize, frame: Frame, is_readonly: bool) -> Result<()> {
-        let parent = self.parent.upgrade().unwrap();
-        let vm_space = parent.vm_space();
-        self.inner
-            .lock()
-            .map_one_page(vm_space, map_addr, frame, is_readonly)
-    }
-
     /// Returns the mapping's start address.
     pub fn map_to_addr(&self) -> Vaddr {
         self.inner.lock().map_to_addr
@@ -191,11 +181,6 @@ impl VmMapping {
     /// Returns the mapping's size.
     pub fn map_size(&self) -> usize {
         self.inner.lock().map_size
-    }
-
-    /// Returns the mapping's offset in the VMO.
-    pub fn vmo_offset(&self) -> Option<usize> {
-        self.inner.lock().vmo_offset
     }
 
     /// Unmaps pages in the range
@@ -234,43 +219,84 @@ impl VmMapping {
 
         let page_aligned_addr = page_fault_addr.align_down(PAGE_SIZE);
 
+        let root_vmar = self.parent.upgrade().unwrap();
+        let mut cursor = root_vmar
+            .vm_space()
+            .cursor_mut(&(page_aligned_addr..page_aligned_addr + PAGE_SIZE))?;
+        let current_mapping = cursor.query().unwrap();
+
+        // Perform COW if it is a write access to a shared mapping.
         if write && !not_present {
-            // Perform COW at page table.
-            let root_vmar = self.parent.upgrade().unwrap();
-            let mut cursor = root_vmar
-                .vm_space()
-                .cursor_mut(&(page_aligned_addr..page_aligned_addr + PAGE_SIZE))?;
             let VmItem::Mapped {
                 va: _,
                 frame,
                 mut prop,
-            } = cursor.query().unwrap()
+            } = current_mapping
             else {
                 return Err(Error::new(Errno::EFAULT));
             };
 
-            if self.is_shared {
+            // Skip if the page fault is already handled.
+            if prop.flags.contains(PageFlags::W) {
+                return Ok(());
+            }
+
+            // If the forked child or parent immediately unmaps the page after
+            // the fork without accessing it, we are the only reference to the
+            // frame. We can directly map the frame as writable without
+            // copying. In this case, the reference count of the frame is 2 (
+            // one for the mapping and one for the frame handle itself).
+            let only_reference = frame.reference_count() == 2;
+
+            if self.is_shared || only_reference {
                 cursor.protect(PAGE_SIZE, |p| p.flags |= PageFlags::W);
             } else {
                 let new_frame = duplicate_frame(&frame)?;
-                prop.flags |= PageFlags::W;
+                prop.flags |= PageFlags::W | PageFlags::ACCESSED | PageFlags::DIRTY;
                 cursor.map(new_frame, prop);
             }
             return Ok(());
         }
 
-        let (frame, is_readonly) = self.prepare_page(page_fault_addr, write)?;
+        // Map a new frame to the page fault address.
+        // Skip if the page fault is already handled.
+        if let VmItem::NotMapped { .. } = current_mapping {
+            let inner_lock = self.inner.lock();
+            let (frame, is_readonly) = self.prepare_page(&inner_lock, page_fault_addr, write)?;
 
-        self.map_one_page(page_aligned_addr, frame, is_readonly)
+            let vm_perms = {
+                let mut perms = inner_lock.perms;
+                if is_readonly {
+                    // COW pages are forced to be read-only.
+                    perms -= VmPerms::WRITE;
+                }
+                perms
+            };
+            let mut page_flags = vm_perms.into();
+            page_flags |= PageFlags::ACCESSED;
+            if write {
+                page_flags |= PageFlags::DIRTY;
+            }
+            let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
+
+            cursor.map(frame, map_prop);
+        }
+
+        Ok(())
     }
 
-    fn prepare_page(&self, page_fault_addr: Vaddr, write: bool) -> Result<(Frame, bool)> {
+    fn prepare_page(
+        &self,
+        inner_lock: &MutexGuard<VmMappingInner>,
+        page_fault_addr: Vaddr,
+        write: bool,
+    ) -> Result<(Frame, bool)> {
         let mut is_readonly = false;
         let Some(vmo) = &self.vmo else {
             return Ok((FrameAllocOptions::new(1).alloc_single()?, is_readonly));
         };
 
-        let vmo_offset = self.vmo_offset().unwrap() + page_fault_addr - self.map_to_addr();
+        let vmo_offset = inner_lock.vmo_offset.unwrap() + page_fault_addr - inner_lock.map_to_addr;
         let page_idx = vmo_offset / PAGE_SIZE;
         let Ok(page) = vmo.get_committed_frame(page_idx) else {
             if !self.is_shared {
@@ -305,7 +331,7 @@ impl VmMapping {
         let vmo_offset = inner.vmo_offset.unwrap();
         let vmo = self.vmo().unwrap();
         let around_page_addr = page_fault_addr & SURROUNDING_PAGE_ADDR_MASK;
-        let valid_size = min(vmo.size() - vmo_offset, inner.map_size);
+        let valid_size = min(vmo.size().saturating_sub(vmo_offset), inner.map_size);
 
         let start_addr = max(around_page_addr, inner.map_to_addr);
         let end_addr = min(
@@ -314,14 +340,18 @@ impl VmMapping {
         );
 
         let vm_perms = inner.perms - VmPerms::WRITE;
-        let vm_map_options = { PageProperty::new(vm_perms.into(), CachePolicy::Writeback) };
         let parent = self.parent.upgrade().unwrap();
         let vm_space = parent.vm_space();
         let mut cursor = vm_space.cursor_mut(&(start_addr..end_addr))?;
         let operate = move |commit_fn: &mut dyn FnMut() -> Result<Frame>| {
-            if let VmItem::NotMapped { .. } = cursor.query().unwrap() {
+            if let VmItem::NotMapped { va, len } = cursor.query().unwrap() {
+                // We regard all the surrounding pages as accessed, no matter
+                // if it is really so. Then the hardware won't bother to update
+                // the accessed bit of the page table on following accesses.
+                let page_flags = PageFlags::from(vm_perms) | PageFlags::ACCESSED;
+                let page_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
                 let frame = commit_fn()?;
-                cursor.map(frame, vm_map_options);
+                cursor.map(frame, page_prop);
             } else {
                 let next_addr = cursor.virt_addr() + PAGE_SIZE;
                 if next_addr < end_addr {
@@ -507,30 +537,6 @@ impl VmMapping {
 }
 
 impl VmMappingInner {
-    fn map_one_page(
-        &mut self,
-        vm_space: &VmSpace,
-        map_addr: usize,
-        frame: Frame,
-        is_readonly: bool,
-    ) -> Result<()> {
-        let map_range = map_addr..map_addr + PAGE_SIZE;
-
-        let vm_perms = {
-            let mut perms = self.perms;
-            if is_readonly {
-                // COW pages are forced to be read-only.
-                perms -= VmPerms::WRITE;
-            }
-            perms
-        };
-        let map_prop = PageProperty::new(vm_perms.into(), CachePolicy::Writeback);
-
-        let mut cursor = vm_space.cursor_mut(&map_range).unwrap();
-        cursor.map(frame, map_prop);
-        Ok(())
-    }
-
     /// Unmap pages in the range.
     fn unmap(&mut self, vm_space: &VmSpace, range: &Range<usize>, may_destroy: bool) -> Result<()> {
         let map_addr = range.start.align_down(PAGE_SIZE);

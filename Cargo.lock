@@ -67,6 +67,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
+name = "aster-bigtcp"
+version = "0.1.0"
+dependencies = [
+ "keyable-arc",
+ "ostd",
+ "smoltcp",
+]
+
+[[package]]
 name = "aster-block"
 version = "0.1.0"
 dependencies = [
@@ -144,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "align_ext",
  "ascii",
+ "aster-bigtcp",
  "aster-block",
  "aster-console",
  "aster-framebuffer",
@@ -179,7 +189,6 @@ dependencies = [
  "ostd",
  "paste",
  "rand",
- "smoltcp",
  "spin 0.9.8",
  "static_assertions",
  "takeable",
@@ -1019,7 +1028,7 @@ checksum = "dd8b5dd2ae5ed71462c540258bedcb51965123ad7e7ccf4b9a8cafaa4a63576d"
 
 [[package]]
 name = "osdk-test-kernel"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "ostd",
  "owo-colors 4.0.0",
@@ -1028,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "ostd"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "acpi",
  "align_ext",
@@ -1070,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "ostd-macros"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1098,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "ostd-test"
-version = "0.8.1"
+version = "0.8.2"
 
 [[package]]
 name = "owo-colors"

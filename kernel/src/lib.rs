@@ -37,6 +37,7 @@ use ostd::{
     arch::qemu::{exit_qemu, QemuExitCode},
     boot,
     cpu::PinCurrentCpu,
+    task::Priority,
 };
 use process::Process;
 
@@ -90,7 +91,7 @@ pub fn main() {
     ostd::boot::smp::register_ap_entry(ap_init);
 
     // Spawn the first kernel thread on BSP.
-    Thread::spawn_kernel_thread(ThreadOptions::new(init_thread));
+    Thread::spawn_kernel_thread(ThreadOptions::new(init_thread).priority(Priority::lowest()));
     // Spawning functions in the bootstrap context will not return.
     unreachable!()
 }
@@ -122,16 +123,17 @@ fn ap_init() -> ! {
     let cpu_id = preempt_guard.current_cpu();
     drop(preempt_guard);
 
-    Thread::spawn_kernel_thread(ThreadOptions::new(ap_idle_thread).cpu_affinity(cpu_id.into()));
+    Thread::spawn_kernel_thread(
+        ThreadOptions::new(ap_idle_thread)
+            .cpu_affinity(cpu_id.into())
+            .priority(Priority::lowest()),
+    );
     // Spawning functions in the bootstrap context will not return.
     unreachable!()
 }
 
 fn init_thread() {
-    println!(
-        "[kernel] Spawn init thread, tid = {}",
-        current_thread!().tid()
-    );
+    println!("[kernel] Spawn init thread");
     // Work queue should be initialized before interrupt is enabled,
     // in case any irq handler uses work queue as bottom half
     thread::work_queue::init();
@@ -141,15 +143,8 @@ fn init_thread() {
     // driver::pci::virtio::block::block_device_test();
     let thread = Thread::spawn_kernel_thread(ThreadOptions::new(|| {
         println!("[kernel] Hello world from kernel!");
-        let current = current_thread!();
-        let tid = current.tid();
-        debug!("current tid = {}", tid);
     }));
     thread.join();
-    info!(
-        "[aster-nix/lib.rs] spawn kernel thread, tid = {}",
-        thread.tid()
-    );
 
     print_banner();
 
