@@ -16,7 +16,6 @@ use crate::{
         socket::{
             options::{Error as SocketError, SocketOption},
             util::{
-                copy_message_from_user, copy_message_to_user, create_message_buffer,
                 options::SocketOptionSet, send_recv_flags::SendRecvFlags, socket_addr::SocketAddr,
                 MessageHeader,
             },
@@ -25,7 +24,7 @@ use crate::{
     },
     prelude::*,
     process::signal::{Pollable, Pollee, Poller},
-    util::IoVec,
+    util::{MultiRead, MultiWrite},
 };
 
 mod bound;
@@ -144,7 +143,11 @@ impl DatagramSocket {
         })
     }
 
-    fn try_recv(&self, buf: &mut [u8], flags: SendRecvFlags) -> Result<(usize, SocketAddr)> {
+    fn try_recv(
+        &self,
+        writer: &mut dyn MultiWrite,
+        flags: SendRecvFlags,
+    ) -> Result<(usize, SocketAddr)> {
         let inner = self.inner.read();
 
         let Inner::Bound(bound_datagram) = inner.as_ref() else {
@@ -152,11 +155,8 @@ impl DatagramSocket {
         };
 
         let received = bound_datagram
-            .try_recv(buf, flags)
-            .map(|(recv_bytes, remote_endpoint)| {
-                bound_datagram.update_io_events(&self.pollee);
-                (recv_bytes, remote_endpoint.into())
-            });
+            .try_recv(writer, flags)
+            .map(|(recv_bytes, remote_endpoint)| (recv_bytes, remote_endpoint.into()));
 
         drop(inner);
         poll_ifaces();
@@ -164,27 +164,31 @@ impl DatagramSocket {
         received
     }
 
-    fn recv(&self, buf: &mut [u8], flags: SendRecvFlags) -> Result<(usize, SocketAddr)> {
+    fn recv(
+        &self,
+        writer: &mut dyn MultiWrite,
+        flags: SendRecvFlags,
+    ) -> Result<(usize, SocketAddr)> {
         if self.is_nonblocking() {
-            self.try_recv(buf, flags)
+            self.try_recv(writer, flags)
         } else {
-            self.wait_events(IoEvents::IN, || self.try_recv(buf, flags))
+            self.wait_events(IoEvents::IN, || self.try_recv(writer, flags))
         }
     }
 
-    fn try_send(&self, buf: &[u8], remote: &IpEndpoint, flags: SendRecvFlags) -> Result<usize> {
+    fn try_send(
+        &self,
+        reader: &mut dyn MultiRead,
+        remote: &IpEndpoint,
+        flags: SendRecvFlags,
+    ) -> Result<usize> {
         let inner = self.inner.read();
 
         let Inner::Bound(bound_datagram) = inner.as_ref() else {
             return_errno_with_message!(Errno::EAGAIN, "the socket is not bound")
         };
 
-        let sent_bytes = bound_datagram
-            .try_send(buf, remote, flags)
-            .map(|sent_bytes| {
-                bound_datagram.update_io_events(&self.pollee);
-                sent_bytes
-            });
+        let sent_bytes = bound_datagram.try_send(reader, remote, flags);
 
         drop(inner);
         poll_ifaces();
@@ -209,16 +213,13 @@ impl Pollable for DatagramSocket {
 
 impl FileLike for DatagramSocket {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
-        let mut buf = vec![0u8; writer.avail()];
         // TODO: set correct flags
         let flags = SendRecvFlags::empty();
-        let read_len = self.recv(&mut buf, flags).map(|(len, _)| len)?;
-        writer.write_fallible(&mut buf.as_slice().into())?;
+        let read_len = self.recv(writer, flags).map(|(len, _)| len)?;
         Ok(read_len)
     }
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {
-        let buf = reader.collect()?;
         let remote = self.remote_endpoint().ok_or_else(|| {
             Error::with_message(
                 Errno::EDESTADDRREQ,
@@ -230,7 +231,7 @@ impl FileLike for DatagramSocket {
         let flags = SendRecvFlags::empty();
 
         // TODO: Block if send buffer is full
-        self.try_send(&buf, &remote, flags)
+        self.try_send(reader, &remote, flags)
     }
 
     fn as_socket(self: Arc<Self>) -> Option<Arc<dyn Socket>> {
@@ -320,7 +321,7 @@ impl Socket for DatagramSocket {
 
     fn sendmsg(
         &self,
-        io_vecs: &[IoVec],
+        reader: &mut dyn MultiRead,
         message_header: MessageHeader,
         flags: SendRecvFlags,
     ) -> Result<usize> {
@@ -351,30 +352,25 @@ impl Socket for DatagramSocket {
             warn!("sending control message is not supported");
         }
 
-        let buf = copy_message_from_user(io_vecs);
-
         // TODO: Block if the send buffer is full
-        self.try_send(&buf, &remote_endpoint, flags)
+        self.try_send(reader, &remote_endpoint, flags)
     }
 
-    fn recvmsg(&self, io_vecs: &[IoVec], flags: SendRecvFlags) -> Result<(usize, MessageHeader)> {
+    fn recvmsg(
+        &self,
+        writer: &mut dyn MultiWrite,
+        flags: SendRecvFlags,
+    ) -> Result<(usize, MessageHeader)> {
         // TODO: Deal with flags
         debug_assert!(flags.is_all_supported());
 
-        let mut buf = create_message_buffer(io_vecs);
-
-        let (received_bytes, peer_addr) = self.recv(&mut buf, flags)?;
-
-        let copied_bytes = {
-            let message = &buf[..received_bytes];
-            copy_message_to_user(io_vecs, message)
-        };
+        let (received_bytes, peer_addr) = self.recv(writer, flags)?;
 
         // TODO: Receive control message
 
         let message_header = MessageHeader::new(Some(peer_addr), None);
 
-        Ok((copied_bytes, message_header))
+        Ok((received_bytes, message_header))
     }
 
     fn get_option(&self, option: &mut dyn SocketOption) -> Result<()> {

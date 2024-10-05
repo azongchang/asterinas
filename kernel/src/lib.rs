@@ -37,12 +37,13 @@ use ostd::{
     arch::qemu::{exit_qemu, QemuExitCode},
     boot,
     cpu::PinCurrentCpu,
-    task::Priority,
 };
 use process::Process;
+use sched::priority::PriorityRange;
 
 use crate::{
     prelude::*,
+    sched::priority::Priority,
     thread::{
         kernel_thread::{KernelThreadExt, ThreadOptions},
         Thread,
@@ -91,7 +92,10 @@ pub fn main() {
     ostd::boot::smp::register_ap_entry(ap_init);
 
     // Spawn the first kernel thread on BSP.
-    Thread::spawn_kernel_thread(ThreadOptions::new(init_thread).priority(Priority::lowest()));
+    Thread::spawn_kernel_thread(
+        ThreadOptions::new(init_thread)
+            .priority(Priority::new(PriorityRange::new(PriorityRange::MAX))),
+    );
     // Spawning functions in the bootstrap context will not return.
     unreachable!()
 }
@@ -100,6 +104,7 @@ pub fn init() {
     util::random::init();
     driver::init();
     time::init();
+    #[cfg(target_arch = "x86_64")]
     net::init();
     sched::init();
     fs::rootfs::init(boot::initramfs()).unwrap();
@@ -126,7 +131,7 @@ fn ap_init() -> ! {
     Thread::spawn_kernel_thread(
         ThreadOptions::new(ap_idle_thread)
             .cpu_affinity(cpu_id.into())
-            .priority(Priority::lowest()),
+            .priority(Priority::new(PriorityRange::new(PriorityRange::MAX))),
     );
     // Spawning functions in the bootstrap context will not return.
     unreachable!()
@@ -137,6 +142,7 @@ fn init_thread() {
     // Work queue should be initialized before interrupt is enabled,
     // in case any irq handler uses work queue as bottom half
     thread::work_queue::init();
+    #[cfg(target_arch = "x86_64")]
     net::lazy_init();
     fs::lazy_init();
     ipc::init();

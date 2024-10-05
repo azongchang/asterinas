@@ -65,7 +65,7 @@
 //! table cursor should add additional entry point checks to prevent these defined
 //! behaviors if they are not wanted.
 
-use core::{any::TypeId, marker::PhantomData, ops::Range};
+use core::{any::TypeId, marker::PhantomData, mem::ManuallyDrop, ops::Range};
 
 use align_ext::AlignExt;
 
@@ -74,7 +74,10 @@ use super::{
     PageTableMode, PageTableNode, PagingConstsTrait, PagingLevel, UserMode,
 };
 use crate::{
-    mm::{page::DynPage, Paddr, PageProperty, Vaddr},
+    mm::{
+        page::{meta::PageTablePageMeta, DynPage, Page},
+        Paddr, PageProperty, Vaddr,
+    },
     task::{disable_preempt, DisabledPreemptGuard},
 };
 
@@ -88,6 +91,9 @@ pub enum PageTableItem {
         va: Vaddr,
         page: DynPage,
         prop: PageProperty,
+    },
+    PageTableNode {
+        page: DynPage,
     },
     #[allow(dead_code)]
     MappedUntracked {
@@ -587,8 +593,21 @@ where
                 continue;
             }
 
-            // Level down if the current PTE points to a page table.
-            if !cur_pte.is_last(self.0.level) {
+            if self.0.va % page_size::<C>(self.0.level) != 0
+                || self.0.va + page_size::<C>(self.0.level) > end
+            {
+                if !is_tracked {
+                    // Level down if we are removing part of a huge untracked page.
+                    self.level_down_split();
+                    continue;
+                }
+
+                if cur_pte.is_last(self.0.level) {
+                    panic!("removing part of a huge page");
+                }
+
+                // Level down if the current PTE points to a page table and we cannot
+                // unmap this page table node entirely.
                 self.0.level_down();
 
                 // We have got down a level. If there's no mapped PTEs in
@@ -602,20 +621,7 @@ where
                     self.0.level_up();
                     self.0.move_forward();
                 }
-
                 continue;
-            }
-
-            // Level down if we are removing part of a huge untracked page.
-            if self.0.va % page_size::<C>(self.0.level) != 0
-                || self.0.va + page_size::<C>(self.0.level) > end
-            {
-                if !is_tracked {
-                    self.level_down_split();
-                    continue;
-                } else {
-                    panic!("removing part of a huge page");
-                }
             }
 
             // Unmap the current page and return it.
@@ -640,7 +646,12 @@ where
                     len: ret_page_size,
                     prop,
                 },
-                Child::None | Child::PageTable(_) => unreachable!(),
+                Child::PageTable(node) => {
+                    let node = ManuallyDrop::new(node);
+                    let page = Page::<PageTablePageMeta<E, C>>::from_raw(node.paddr());
+                    PageTableItem::PageTableNode { page: page.into() }
+                }
+                Child::None => unreachable!(),
             };
         }
 
@@ -734,26 +745,93 @@ where
         None
     }
 
-    pub fn preempt_guard(&self) -> &DisabledPreemptGuard {
-        &self.0.preempt_guard
-    }
-
-    /// Consumes itself and leak the root guard for the caller if it locked the root level.
+    /// Copies the mapping from the given cursor to the current cursor.
     ///
-    /// It is useful when the caller wants to keep the root guard while the cursor should be dropped.
-    pub(super) fn leak_root_guard(mut self) -> Option<PageTableNode<E, C>> {
-        if self.0.guard_level != C::NR_LEVELS {
-            return None;
+    /// All the mappings in the current cursor's range must be empty. The
+    /// function allows the source cursor to operate on the mapping before
+    /// the copy happens. So it is equivalent to protect then duplicate.
+    /// Only the mapping is copied, the mapped pages are not copied.
+    ///
+    /// It can only copy tracked mappings since we consider the untracked
+    /// mappings not useful to be copied.
+    ///
+    /// After the operation, both cursors will advance by the specified length.
+    ///
+    /// # Safety
+    ///
+    /// The caller should ensure that
+    ///  - the range being copied with the operation does not affect kernel's
+    ///    memory safety.
+    ///  - both of the cursors are in tracked mappings.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if:
+    ///  - either one of the range to be copied is out of the range where any
+    ///    of the cursor is required to operate;
+    ///  - either one of the specified virtual address ranges only covers a
+    ///    part of a page.
+    ///  - the current cursor's range contains mapped pages.
+    pub unsafe fn copy_from(
+        &mut self,
+        src: &mut Self,
+        len: usize,
+        op: &mut impl FnMut(&mut PageProperty),
+    ) {
+        assert!(len % page_size::<C>(1) == 0);
+        let this_end = self.0.va + len;
+        assert!(this_end <= self.0.barrier_va.end);
+        let src_end = src.0.va + len;
+        assert!(src_end <= src.0.barrier_va.end);
+
+        while self.0.va < this_end && src.0.va < src_end {
+            let cur_pte = src.0.read_cur_pte();
+            if !cur_pte.is_present() {
+                src.0.move_forward();
+                continue;
+            }
+
+            // Go down if it's not a last node.
+            if !cur_pte.is_last(src.0.level) {
+                src.0.level_down();
+
+                // We have got down a level. If there's no mapped PTEs in
+                // the current node, we can go back and skip to save time.
+                if src.0.guards[(src.0.level - 1) as usize]
+                    .as_ref()
+                    .unwrap()
+                    .nr_children()
+                    == 0
+                {
+                    src.0.level_up();
+                    src.0.move_forward();
+                }
+
+                continue;
+            }
+
+            // Do protection.
+            let mut pte_prop = cur_pte.prop();
+            op(&mut pte_prop);
+
+            let idx = src.0.cur_idx();
+            src.cur_node_mut().protect(idx, pte_prop);
+
+            // Do copy.
+            let child = src.cur_node_mut().child(idx, true);
+            let Child::<E, C>::Page(page, prop) = child else {
+                panic!("Unexpected child for source mapping: {:#?}", child);
+            };
+            self.jump(src.0.va).unwrap();
+            let mapped_page_size = page.size();
+            let original = self.map(page, prop);
+            debug_assert!(original.is_none());
+
+            // Only move the source cursor forward since `Self::map` will do it.
+            // This assertion is to ensure that they move by the same length.
+            debug_assert_eq!(mapped_page_size, page_size::<C>(src.0.level));
+            src.0.move_forward();
         }
-
-        while self.0.level < C::NR_LEVELS {
-            self.0.level_up();
-        }
-
-        self.0.guards[(C::NR_LEVELS - 1) as usize].take()
-
-        // Ok to drop the cursor here because we ensure not to access the page table if the current
-        // level is the root level when running the dropping method.
     }
 
     /// Goes down a level assuming the current slot is absent.

@@ -14,14 +14,21 @@ use core::ops::Range;
 
 use align_ext::AlignExt;
 use aster_rights::Rights;
-use ostd::mm::{VmSpace, MAX_USERSPACE_VADDR};
+use ostd::{
+    cpu::CpuExceptionInfo,
+    mm::{tlb::TlbFlushOp, PageFlags, PageProperty, VmSpace, MAX_USERSPACE_VADDR},
+};
 
 use self::{
     interval::{Interval, IntervalSet},
     vm_mapping::VmMapping,
 };
 use super::page_fault_handler::PageFaultHandler;
-use crate::{prelude::*, thread::exception::handle_page_fault_from_vm_space, vm::perms::VmPerms};
+use crate::{
+    prelude::*,
+    thread::exception::{handle_page_fault_from_vm_space, PageFaultInfo},
+    vm::perms::VmPerms,
+};
 
 /// Virtual Memory Address Regions (VMARs) are a type of capability that manages
 /// user address spaces.
@@ -72,12 +79,7 @@ impl<R> VmarRightsOp for Vmar<R> {
 
 // TODO: how page faults can be delivered to and handled by the current VMAR.
 impl<R> PageFaultHandler for Vmar<R> {
-    default fn handle_page_fault(
-        &self,
-        page_fault_addr: Vaddr,
-        not_present: bool,
-        write: bool,
-    ) -> Result<()> {
+    default fn handle_page_fault(&self, _page_fault_info: &PageFaultInfo) -> Result<()> {
         unimplemented!()
     }
 }
@@ -227,8 +229,8 @@ impl Vmar_ {
             vm_mappings: BTreeMap::new(),
             free_regions,
         };
-        let vm_space = VmSpace::new();
-        vm_space.register_page_fault_handler(handle_page_fault_from_vm_space);
+        let mut vm_space = VmSpace::new();
+        vm_space.register_page_fault_handler(handle_page_fault_wrapper);
         Vmar_::new(vmar_inner, Arc::new(vm_space), 0, ROOT_VMAR_CAP_ADDR, None)
     }
 
@@ -298,33 +300,23 @@ impl Vmar_ {
         Ok(())
     }
 
-    /// Handles user space page fault, if the page fault is successfully handled ,return Ok(()).
-    fn handle_page_fault(
-        &self,
-        page_fault_addr: Vaddr,
-        not_present: bool,
-        write: bool,
-    ) -> Result<()> {
-        if page_fault_addr < self.base || page_fault_addr >= self.base + self.size {
+    /// Handles user space page fault, if the page fault is successfully handled, return Ok(()).
+    pub fn handle_page_fault(&self, page_fault_info: &PageFaultInfo) -> Result<()> {
+        let address = page_fault_info.address;
+        if !(self.base..self.base + self.size).contains(&address) {
             return_errno_with_message!(Errno::EACCES, "page fault addr is not in current vmar");
         }
 
         let inner = self.inner.lock();
-        if let Some(child_vmar) = inner.child_vmar_s.find_one(&page_fault_addr) {
-            debug_assert!(is_intersected(
-                &child_vmar.range(),
-                &(page_fault_addr..page_fault_addr + 1)
-            ));
-            return child_vmar.handle_page_fault(page_fault_addr, not_present, write);
+        if let Some(child_vmar) = inner.child_vmar_s.find_one(&address) {
+            debug_assert!(child_vmar.range().contains(&address));
+            return child_vmar.handle_page_fault(page_fault_info);
         }
 
         // FIXME: If multiple VMOs are mapped to the addr, should we allow all VMOs to handle page fault?
-        if let Some(vm_mapping) = inner.vm_mappings.find_one(&page_fault_addr) {
-            debug_assert!(is_intersected(
-                &vm_mapping.range(),
-                &(page_fault_addr..page_fault_addr + 1)
-            ));
-            return vm_mapping.handle_page_fault(page_fault_addr, not_present, write);
+        if let Some(vm_mapping) = inner.vm_mappings.find_one(&address) {
+            debug_assert!(vm_mapping.range().contains(&address));
+            return vm_mapping.handle_page_fault(page_fault_info);
         }
 
         return_errno_with_message!(Errno::EACCES, "page fault addr is not in current vmar");
@@ -347,10 +339,8 @@ impl Vmar_ {
     }
 
     fn clear_vm_space(&self) {
-        let start = ROOT_VMAR_LOWEST_ADDR;
-        let end = ROOT_VMAR_CAP_ADDR;
-        let mut cursor = self.vm_space.cursor_mut(&(start..end)).unwrap();
-        cursor.unmap(end - start);
+        let mut cursor = self.vm_space.cursor_mut(&(0..ROOT_VMAR_CAP_ADDR)).unwrap();
+        cursor.unmap(ROOT_VMAR_CAP_ADDR);
     }
 
     pub fn destroy(&self, range: Range<usize>) -> Result<()> {
@@ -669,17 +659,19 @@ impl Vmar_ {
             let vm_space = if let Some(parent) = parent {
                 parent.vm_space().clone()
             } else {
-                Arc::new(self.vm_space().fork_copy_on_write())
+                let mut new_space = VmSpace::new();
+                new_space.register_page_fault_handler(handle_page_fault_wrapper);
+                Arc::new(new_space)
             };
             Vmar_::new(vmar_inner, vm_space, self.base, self.size, parent)
         };
 
         let inner = self.inner.lock();
+        let mut new_inner = new_vmar_.inner.lock();
+
         // Clone free regions.
         for (free_region_base, free_region) in &inner.free_regions {
-            new_vmar_
-                .inner
-                .lock()
+            new_inner
                 .free_regions
                 .insert(*free_region_base, free_region.clone());
         }
@@ -687,24 +679,47 @@ impl Vmar_ {
         // Clone child vmars.
         for (child_vmar_base, child_vmar_) in &inner.child_vmar_s {
             let new_child_vmar = child_vmar_.new_fork(Some(&new_vmar_))?;
-            new_vmar_
-                .inner
-                .lock()
+            new_inner
                 .child_vmar_s
                 .insert(*child_vmar_base, new_child_vmar);
         }
 
         // Clone mappings.
-        for (vm_mapping_base, vm_mapping) in &inner.vm_mappings {
-            let new_mapping = Arc::new(vm_mapping.new_fork(&new_vmar_)?);
-            new_vmar_
-                .inner
-                .lock()
-                .vm_mappings
-                .insert(*vm_mapping_base, new_mapping);
+        {
+            let new_vmspace = new_vmar_.vm_space();
+            let range = self.base..(self.base + self.size);
+            let mut new_cursor = new_vmspace.cursor_mut(&range).unwrap();
+            let cur_vmspace = self.vm_space();
+            let mut cur_cursor = cur_vmspace.cursor_mut(&range).unwrap();
+            for (vm_mapping_base, vm_mapping) in &inner.vm_mappings {
+                // Clone the `VmMapping` to the new VMAR.
+                let new_mapping = Arc::new(vm_mapping.new_fork(&new_vmar_)?);
+                new_inner.vm_mappings.insert(*vm_mapping_base, new_mapping);
+
+                // Protect the mapping and copy to the new page table for COW.
+                cur_cursor.jump(*vm_mapping_base).unwrap();
+                new_cursor.jump(*vm_mapping_base).unwrap();
+                let mut op = |page: &mut PageProperty| {
+                    page.flags -= PageFlags::W;
+                };
+                new_cursor.copy_from(&mut cur_cursor, vm_mapping.map_size(), &mut op);
+            }
+            cur_cursor.flusher().issue_tlb_flush(TlbFlushOp::All);
+            cur_cursor.flusher().dispatch_tlb_flush();
         }
+
+        drop(new_inner);
+
         Ok(new_vmar_)
     }
+}
+
+/// This is for fallible user space write handling.
+fn handle_page_fault_wrapper(
+    vm_space: &VmSpace,
+    trap_info: &CpuExceptionInfo,
+) -> core::result::Result<(), ()> {
+    handle_page_fault_from_vm_space(vm_space, &trap_info.try_into().unwrap())
 }
 
 impl<R> Vmar<R> {

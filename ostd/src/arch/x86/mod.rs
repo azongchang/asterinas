@@ -39,7 +39,7 @@ use kernel::apic::ioapic;
 use log::{info, warn};
 
 #[cfg(feature = "cvm_guest")]
-pub(crate) fn check_tdx_init() {
+pub(crate) fn init_cvm_guest() {
     match init_tdx() {
         Ok(td_info) => {
             early_println!(
@@ -60,6 +60,10 @@ pub(crate) fn check_tdx_init() {
 }
 
 pub(crate) fn init_on_bsp() {
+    // SAFETY: this function is only called once on BSP.
+    unsafe {
+        crate::arch::trap::init(true);
+    }
     irq::init();
     kernel::acpi::init();
 

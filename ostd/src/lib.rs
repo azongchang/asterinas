@@ -9,6 +9,7 @@
 #![feature(coroutines)]
 #![feature(fn_traits)]
 #![feature(generic_const_exprs)]
+#![feature(is_none_or)]
 #![feature(iter_from_coroutine)]
 #![feature(let_chains)]
 #![feature(min_specialization)]
@@ -17,6 +18,8 @@
 #![feature(panic_info_message)]
 #![feature(ptr_sub_ptr)]
 #![feature(strict_provenance)]
+#![feature(sync_unsafe_cell)]
+#![feature(allocator_api)]
 // The `generic_const_exprs` feature is incomplete however required for the page table
 // const generic implementation. We are using this feature in a conservative manner.
 #![allow(incomplete_features)]
@@ -42,6 +45,7 @@ pub mod prelude;
 pub mod smp;
 pub mod sync;
 pub mod task;
+pub mod timer;
 pub mod trap;
 pub mod user;
 
@@ -72,7 +76,7 @@ pub unsafe fn init() {
     arch::serial::init();
 
     #[cfg(feature = "cvm_guest")]
-    arch::check_tdx_init();
+    arch::init_cvm_guest();
 
     // SAFETY: This function is called only once and only on the BSP.
     unsafe { cpu::local::early_init_bsp_local_base() };
@@ -84,9 +88,8 @@ pub unsafe fn init() {
 
     mm::page::allocator::init();
     mm::kspace::init_kernel_page_table(mm::init_page_meta());
-    mm::misc_init();
+    mm::dma::init();
 
-    trapframe::init();
     // SAFETY: This function is called only once in the entire system.
     unsafe { trap::softirq::init() };
     arch::init_on_bsp();

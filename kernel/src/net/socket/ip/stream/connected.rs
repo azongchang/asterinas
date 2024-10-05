@@ -4,22 +4,23 @@ use alloc::sync::Weak;
 
 use aster_bigtcp::{
     errors::tcp::{RecvError, SendError},
-    socket::{RawTcpSocket, SocketEventObserver},
+    socket::SocketEventObserver,
     wire::IpEndpoint,
 };
 
 use crate::{
     events::IoEvents,
     net::{
-        iface::AnyBoundSocket,
+        iface::BoundTcpSocket,
         socket::util::{send_recv_flags::SendRecvFlags, shutdown_cmd::SockShutdownCmd},
     },
     prelude::*,
     process::signal::Pollee,
+    util::{MultiRead, MultiWrite},
 };
 
 pub struct ConnectedStream {
-    bound_socket: AnyBoundSocket,
+    bound_socket: BoundTcpSocket,
     remote_endpoint: IpEndpoint,
     /// Indicates whether this connection is "new" in a `connect()` system call.
     ///
@@ -36,7 +37,7 @@ pub struct ConnectedStream {
 
 impl ConnectedStream {
     pub fn new(
-        bound_socket: AnyBoundSocket,
+        bound_socket: BoundTcpSocket,
         remote_endpoint: IpEndpoint,
         is_new_connection: bool,
     ) -> Self {
@@ -49,20 +50,22 @@ impl ConnectedStream {
 
     pub fn shutdown(&self, _cmd: SockShutdownCmd) -> Result<()> {
         // TODO: deal with cmd
-        self.bound_socket.raw_with(|socket: &mut RawTcpSocket| {
-            socket.close();
-        });
+        self.bound_socket.close();
         Ok(())
     }
 
-    pub fn try_recv(&self, buf: &mut [u8], _flags: SendRecvFlags) -> Result<usize> {
-        let result = self
-            .bound_socket
-            .raw_with(|socket: &mut RawTcpSocket| socket.recv_slice(buf));
+    pub fn try_recv(&self, writer: &mut dyn MultiWrite, _flags: SendRecvFlags) -> Result<usize> {
+        let result = self.bound_socket.recv(|socket_buffer| {
+            match writer.write(&mut VmReader::from(&*socket_buffer)) {
+                Ok(len) => (len, Ok(len)),
+                Err(e) => (0, Err(e)),
+            }
+        });
 
         match result {
-            Ok(0) => return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty"),
-            Ok(recv_bytes) => Ok(recv_bytes),
+            Ok(Ok(0)) => return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty"),
+            Ok(Ok(recv_bytes)) => Ok(recv_bytes),
+            Ok(Err(e)) => Err(e),
             Err(RecvError::Finished) => Ok(0),
             Err(RecvError::InvalidState) => {
                 return_errno_with_message!(Errno::ECONNRESET, "the connection is reset")
@@ -70,14 +73,18 @@ impl ConnectedStream {
         }
     }
 
-    pub fn try_send(&self, buf: &[u8], _flags: SendRecvFlags) -> Result<usize> {
-        let result = self
-            .bound_socket
-            .raw_with(|socket: &mut RawTcpSocket| socket.send_slice(buf));
+    pub fn try_send(&self, reader: &mut dyn MultiRead, _flags: SendRecvFlags) -> Result<usize> {
+        let result = self.bound_socket.send(|socket_buffer| {
+            match reader.read(&mut VmWriter::from(socket_buffer)) {
+                Ok(len) => (len, Ok(len)),
+                Err(e) => (0, Err(e)),
+            }
+        });
 
         match result {
-            Ok(0) => return_errno_with_message!(Errno::EAGAIN, "the send buffer is full"),
-            Ok(sent_bytes) => Ok(sent_bytes),
+            Ok(Ok(0)) => return_errno_with_message!(Errno::EAGAIN, "the send buffer is full"),
+            Ok(Ok(sent_bytes)) => Ok(sent_bytes),
+            Ok(Err(e)) => Err(e),
             Err(SendError::InvalidState) => {
                 // FIXME: `EPIPE` is another possibility, which means that the socket is shut down
                 // for writing. In that case, we should also trigger a `SIGPIPE` if `MSG_NOSIGNAL`
@@ -110,7 +117,7 @@ impl ConnectedStream {
     }
 
     pub(super) fn update_io_events(&self, pollee: &Pollee) {
-        self.bound_socket.raw_with(|socket: &mut RawTcpSocket| {
+        self.bound_socket.raw_with(|socket| {
             if socket.can_recv() {
                 pollee.add_events(IoEvents::IN);
             } else {

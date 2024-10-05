@@ -4,10 +4,13 @@
 
 use core::sync::atomic::Ordering;
 
-use ostd::task::Task;
+use ostd::{cpu::CpuSet, sync::PreemptDisabled, task::Task};
 
 use self::status::{AtomicThreadStatus, ThreadStatus};
-use crate::prelude::*;
+use crate::{
+    prelude::*,
+    sched::priority::{AtomicPriority, Priority},
+};
 
 pub mod exception;
 pub mod kernel_thread;
@@ -26,16 +29,29 @@ pub struct Thread {
     data: Box<dyn Send + Sync + Any>,
 
     // mutable part
+    /// Thread status
     status: AtomicThreadStatus,
+    /// Thread priority
+    priority: AtomicPriority,
+    /// Thread cpu affinity
+    cpu_affinity: SpinLock<CpuSet>,
 }
 
 impl Thread {
     /// Never call these function directly
-    pub fn new(task: Weak<Task>, data: impl Send + Sync + Any, status: ThreadStatus) -> Self {
+    pub fn new(
+        task: Weak<Task>,
+        data: impl Send + Sync + Any,
+        status: ThreadStatus,
+        priority: Priority,
+        cpu_affinity: CpuSet,
+    ) -> Self {
         Thread {
             task,
             data: Box::new(data),
             status: AtomicThreadStatus::new(status),
+            priority: AtomicPriority::new(priority),
+            cpu_affinity: SpinLock::new(cpu_affinity),
         }
     }
 
@@ -55,7 +71,7 @@ impl Thread {
     /// # Panics
     ///
     /// This method panics if the task is not a thread.
-    pub fn borrow_from_task(task: &Arc<Task>) -> &Arc<Self> {
+    pub fn borrow_from_task(task: &Task) -> &Arc<Self> {
         task.data().downcast_ref::<Arc<Thread>>().unwrap()
     }
 
@@ -79,9 +95,34 @@ impl Thread {
         self.status.load(Ordering::Acquire)
     }
 
-    /// Updates the status with the `new` value.
+    /// Updates the status with the new value.
     pub fn set_status(&self, new_status: ThreadStatus) {
         self.status.store(new_status, Ordering::Release);
+    }
+
+    /// Returns the reference to the atomic priority.
+    pub fn atomic_priority(&self) -> &AtomicPriority {
+        &self.priority
+    }
+
+    /// Returns the current priority.
+    pub fn priority(&self) -> Priority {
+        self.priority.load(Ordering::Relaxed)
+    }
+
+    /// Updates the priority with the new value.
+    pub fn set_priority(&self, new_priority: Priority) {
+        self.priority.store(new_priority, Ordering::Relaxed)
+    }
+
+    /// Acquires the lock of cpu affinity.
+    pub fn lock_cpu_affinity(&self) -> SpinLockGuard<CpuSet, PreemptDisabled> {
+        self.cpu_affinity.lock()
+    }
+
+    /// Updates the cpu affinity with the new value.
+    pub fn set_cpu_affinity(&self, new_cpu_affinity: CpuSet) {
+        *self.cpu_affinity.lock() = new_cpu_affinity;
     }
 
     pub fn yield_now() {

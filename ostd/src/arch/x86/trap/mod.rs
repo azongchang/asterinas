@@ -1,15 +1,32 @@
+// SPDX-License-Identifier: MPL-2.0 OR MIT
+//
+// The original source code is from [trapframe-rs](https://github.com/rcore-os/trapframe-rs),
+// which is released under the following license:
+//
+// SPDX-License-Identifier: MIT
+//
+// Copyright (c) 2020 - 2024 Runji Wang
+//
+// We make the following new changes:
+// * Implement the `trap_handler` of Asterinas.
+//
+// These changes are released under the following license:
+//
 // SPDX-License-Identifier: MPL-2.0
 
 //! Handles trap.
 
+mod gdt;
+mod idt;
+mod syscall;
+
 use align_ext::AlignExt;
 use cfg_if::cfg_if;
 use log::debug;
-use trapframe::TrapFrame;
 
 use super::ex_table::ExTable;
 use crate::{
-    cpu::{CpuException, CpuExceptionInfo, PageFaultErrorCode, PAGE_FAULT},
+    cpu::{CpuException, CpuExceptionInfo, PageFaultErrorCode},
     cpu_local_cell,
     mm::{
         kspace::{KERNEL_PAGE_TABLE, LINEAR_MAPPING_BASE_VADDR, LINEAR_MAPPING_VADDR_RANGE},
@@ -23,12 +40,174 @@ use crate::{
 cfg_if! {
     if #[cfg(feature = "cvm_guest")] {
         use tdx_guest::{tdcall, tdx_is_enabled, handle_virtual_exception};
-        use crate::arch::{cpu::VIRTUALIZATION_EXCEPTION, tdx_guest::TrapFrameWrapper};
+        use crate::arch::tdx_guest::TrapFrameWrapper;
     }
 }
 
 cpu_local_cell! {
     static IS_KERNEL_INTERRUPTED: bool = false;
+}
+
+/// Trap frame of kernel interrupt
+///
+/// # Trap handler
+///
+/// You need to define a handler function like this:
+///
+/// ```
+/// #[no_mangle]
+/// extern "sysv64" fn trap_handler(tf: &mut TrapFrame) {
+///     match tf.trap_num {
+///         3 => {
+///             println!("TRAP: BreakPoint");
+///             tf.rip += 1;
+///         }
+///         _ => panic!("TRAP: {:#x?}", tf),
+///     }
+/// }
+/// ```
+#[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct TrapFrame {
+    // Pushed by 'trap.S'
+    pub rax: usize,
+    pub rbx: usize,
+    pub rcx: usize,
+    pub rdx: usize,
+    pub rsi: usize,
+    pub rdi: usize,
+    pub rbp: usize,
+    pub rsp: usize,
+    pub r8: usize,
+    pub r9: usize,
+    pub r10: usize,
+    pub r11: usize,
+    pub r12: usize,
+    pub r13: usize,
+    pub r14: usize,
+    pub r15: usize,
+    pub _pad: usize,
+
+    pub trap_num: usize,
+    pub error_code: usize,
+
+    // Pushed by CPU
+    pub rip: usize,
+    pub cs: usize,
+    pub rflags: usize,
+}
+
+/// Initialize interrupt handling on x86_64.
+///
+/// # Safety
+///
+/// This function will:
+///
+/// - Disable interrupt.
+/// - Switch to a new [GDT], extend 7 more entries from the current one.
+/// - Switch to a new [TSS], `GSBASE` pointer to its base address.
+/// - Switch to a new [IDT], override the current one.
+/// - Enable [`syscall`] instruction.
+///     - set `EFER::SYSTEM_CALL_EXTENSIONS`
+///
+/// [GDT]: https://wiki.osdev.org/GDT
+/// [IDT]: https://wiki.osdev.org/IDT
+/// [TSS]: https://wiki.osdev.org/Task_State_Segment
+/// [`syscall`]: https://www.felixcloutier.com/x86/syscall
+///
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub unsafe fn init(on_bsp: bool) {
+    x86_64::instructions::interrupts::disable();
+    gdt::init(on_bsp);
+    idt::init();
+    syscall::init();
+}
+
+/// User space context.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct UserContext {
+    pub general: GeneralRegs,
+    pub trap_num: usize,
+    pub error_code: usize,
+}
+
+/// General registers.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct GeneralRegs {
+    pub rax: usize,
+    pub rbx: usize,
+    pub rcx: usize,
+    pub rdx: usize,
+    pub rsi: usize,
+    pub rdi: usize,
+    pub rbp: usize,
+    pub rsp: usize,
+    pub r8: usize,
+    pub r9: usize,
+    pub r10: usize,
+    pub r11: usize,
+    pub r12: usize,
+    pub r13: usize,
+    pub r14: usize,
+    pub r15: usize,
+    pub rip: usize,
+    pub rflags: usize,
+    pub fsbase: usize,
+    pub gsbase: usize,
+}
+
+impl UserContext {
+    /// Get number of syscall.
+    pub fn get_syscall_num(&self) -> usize {
+        self.general.rax
+    }
+
+    /// Get return value of syscall.
+    pub fn get_syscall_ret(&self) -> usize {
+        self.general.rax
+    }
+
+    /// Set return value of syscall.
+    pub fn set_syscall_ret(&mut self, ret: usize) {
+        self.general.rax = ret;
+    }
+
+    /// Get syscall args.
+    pub fn get_syscall_args(&self) -> [usize; 6] {
+        [
+            self.general.rdi,
+            self.general.rsi,
+            self.general.rdx,
+            self.general.r10,
+            self.general.r8,
+            self.general.r9,
+        ]
+    }
+
+    /// Set instruction pointer.
+    pub fn set_ip(&mut self, ip: usize) {
+        self.general.rip = ip;
+    }
+
+    /// Set stack pointer.
+    pub fn set_sp(&mut self, sp: usize) {
+        self.general.rsp = sp;
+    }
+
+    /// Get stack pointer.
+    pub fn get_sp(&self) -> usize {
+        self.general.rsp
+    }
+
+    /// Set thread-local storage pointer.
+    pub fn set_tls(&mut self, tls: usize) {
+        self.general.fsbase = tls;
+    }
 }
 
 /// Returns true if this function is called within the context of an IRQ handler
@@ -38,19 +217,19 @@ pub fn is_kernel_interrupted() -> bool {
     IS_KERNEL_INTERRUPTED.load()
 }
 
-/// Only from kernel
+/// Handle traps (only from kernel).
 #[no_mangle]
 extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
     if CpuException::is_cpu_exception(f.trap_num as u16) {
         match CpuException::to_cpu_exception(f.trap_num as u16).unwrap() {
             #[cfg(feature = "cvm_guest")]
-            &VIRTUALIZATION_EXCEPTION => {
+            CpuException::VIRTUALIZATION_EXCEPTION => {
                 let ve_info = tdcall::get_veinfo().expect("#VE handler: fail to get VE info\n");
                 let mut trapframe_wrapper = TrapFrameWrapper(&mut *f);
                 handle_virtual_exception(&mut trapframe_wrapper, &ve_info);
                 *f = *trapframe_wrapper.0;
             }
-            &PAGE_FAULT => {
+            CpuException::PAGE_FAULT => {
                 let page_fault_addr = x86_64::registers::control::Cr2::read_raw();
                 // The actual user space implementation should be responsible
                 // for providing mechanism to treat the 0 virtual address.

@@ -10,6 +10,8 @@ cd ${SCRIPT_DIR}/..
 echo "Start process test......"
 # These test programs are sorted by name.
 tests="
+clone3/clone_exit_signal
+clone3/clone_no_exit_signal
 clone3/clone_process
 execve/execve
 eventfd2/eventfd2
@@ -22,6 +24,7 @@ itimer/setitimer
 itimer/timer_create
 mmap/mmap_and_fork
 mmap/mmap_shared_filebacked
+mmap/mmap_readahead
 pthread/pthread_test
 pty/open_pty
 signal_c/parent_death_signal

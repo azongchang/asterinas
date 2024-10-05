@@ -2,13 +2,13 @@
 
 use std::path::PathBuf;
 
-use clap::{crate_version, Args, Parser};
+use clap::{crate_version, Args, Parser, ValueEnum};
 
 use crate::{
     arch::Arch,
     commands::{
         execute_build_command, execute_debug_command, execute_forwarded_command,
-        execute_new_command, execute_run_command, execute_test_command,
+        execute_new_command, execute_profile_command, execute_run_command, execute_test_command,
     },
     config::{
         manifest::{ProjectType, TomlManifest},
@@ -37,13 +37,19 @@ pub fn main() {
         OsdkSubcommand::Run(run_args) => {
             execute_run_command(
                 &load_config(&run_args.common_args),
-                &run_args.gdb_server_args,
+                run_args.gdb_server.as_deref(),
             );
         }
         OsdkSubcommand::Debug(debug_args) => {
             execute_debug_command(
                 &load_config(&debug_args.common_args).run.build.profile,
                 debug_args,
+            );
+        }
+        OsdkSubcommand::Profile(profile_args) => {
+            execute_profile_command(
+                &load_config(&profile_args.common_args).run.build.profile,
+                profile_args,
             );
         }
         OsdkSubcommand::Test(test_args) => {
@@ -79,6 +85,8 @@ pub enum OsdkSubcommand {
     Run(RunArgs),
     #[command(about = "Debug a remote target via GDB")]
     Debug(DebugArgs),
+    #[command(about = "Profile a remote GDB debug target to collect stack traces for flame graph")]
+    Profile(ProfileArgs),
     #[command(about = "Execute kernel mode unit test by starting a VMM")]
     Test(TestArgs),
     #[command(about = "Check a local package and all of its dependencies for errors")]
@@ -160,37 +168,20 @@ pub struct BuildArgs {
 
 #[derive(Debug, Parser)]
 pub struct RunArgs {
-    #[command(flatten)]
-    pub gdb_server_args: GdbServerArgs,
+    #[arg(
+        long = "gdb-server",
+        help = "Enable the QEMU GDB server for debugging\n\
+                This option supports an additional comma separated configuration list:\n\t \
+                    addr=ADDR:   the network or unix socket address on which the GDB server listens, \
+                                 `.osdk-gdb-socket` by default;\n\t \
+                    wait-client: let the GDB server wait for the GDB client before execution;\n\t \
+                    vscode:      generate a '.vscode/launch.json' for debugging with Visual Studio Code.",
+        value_name = "[addr=ADDR][,wait-client][,vscode]",
+        default_missing_value = ""
+    )]
+    pub gdb_server: Option<String>,
     #[command(flatten)]
     pub common_args: CommonArgs,
-}
-
-#[derive(Debug, Args, Clone, Default)]
-pub struct GdbServerArgs {
-    /// Whether to enable QEMU GDB server for debugging
-    #[arg(
-        long = "enable-gdb",
-        short = 'G',
-        help = "Enable QEMU GDB server for debugging",
-        default_value_t
-    )]
-    pub is_gdb_enabled: bool,
-    #[arg(
-        long = "vsc",
-        help = "Generate a '.vscode/launch.json' for debugging with Visual Studio Code \
-                (only works when '--enable-gdb' is enabled)",
-        default_value_t
-    )]
-    pub vsc_launch_file: bool,
-    #[arg(
-        long = "gdb-server-addr",
-        help = "The network address on which the GDB server listens, \
-        it can be either a path for the UNIX domain socket or a TCP port on an IP address.",
-        value_name = "ADDR",
-        default_value = ".aster-gdb-socket"
-    )]
-    pub gdb_server_addr: String,
 }
 
 #[derive(Debug, Parser)]
@@ -198,11 +189,129 @@ pub struct DebugArgs {
     #[arg(
         long,
         help = "Specify the address of the remote target",
-        default_value = ".aster-gdb-socket"
+        default_value = ".osdk-gdb-socket"
     )]
     pub remote: String,
     #[command(flatten)]
     pub common_args: CommonArgs,
+}
+
+#[derive(Debug, Parser)]
+pub struct ProfileArgs {
+    #[arg(
+        long,
+        help = "Specify the address of the remote target",
+        default_value = ".osdk-gdb-socket"
+    )]
+    pub remote: String,
+    #[arg(long, help = "The number of samples to collect", default_value = "200")]
+    pub samples: usize,
+    #[arg(
+        long,
+        help = "The interval between samples in seconds",
+        default_value = "0.1"
+    )]
+    pub interval: f64,
+    #[arg(
+        long,
+        help = "Parse a collected JSON profile file into other formats",
+        value_name = "PATH",
+        conflicts_with = "samples",
+        conflicts_with = "interval"
+    )]
+    pub parse: Option<PathBuf>,
+    #[command(flatten)]
+    pub out_args: DebugProfileOutArgs,
+    #[command(flatten)]
+    pub common_args: CommonArgs,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ProfileFormat {
+    /// The raw stack trace log parsed from GDB in JSON
+    Json,
+    /// The folded stack trace for generating a flame graph later using
+    /// [the original tool](https://github.com/brendangregg/FlameGraph)
+    Folded,
+    /// A SVG flame graph
+    FlameGraph,
+}
+
+impl ProfileFormat {
+    pub fn file_extension(&self) -> &'static str {
+        match self {
+            ProfileFormat::Json => "json",
+            ProfileFormat::Folded => "folded",
+            ProfileFormat::FlameGraph => "svg",
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+pub struct DebugProfileOutArgs {
+    #[arg(long, help = "The output format for the profile data")]
+    format: Option<ProfileFormat>,
+    #[arg(
+        long,
+        help = "The mask of the CPU to generate traces for in the output profile data",
+        default_value_t = u128::MAX
+    )]
+    pub cpu_mask: u128,
+    #[arg(
+        long,
+        help = "The path to the output profile data file",
+        value_name = "PATH"
+    )]
+    output: Option<PathBuf>,
+}
+
+impl DebugProfileOutArgs {
+    /// Get the output format for the profile data.
+    ///
+    /// If the user does not specify the format, it will be inferred from the
+    /// output file extension. If the output file does not have an extension,
+    /// the default format is flame graph.
+    pub fn format(&self) -> ProfileFormat {
+        self.format.unwrap_or_else(|| {
+            if self.output.is_some() {
+                match self.output.as_ref().unwrap().extension() {
+                    Some(ext) if ext == "folded" => ProfileFormat::Folded,
+                    Some(ext) if ext == "json" => ProfileFormat::Json,
+                    Some(ext) if ext == "svg" => ProfileFormat::FlameGraph,
+                    _ => ProfileFormat::FlameGraph,
+                }
+            } else {
+                ProfileFormat::FlameGraph
+            }
+        })
+    }
+
+    /// Get the output path for the profile data.
+    ///
+    /// If the user does not specify the output path, it will be generated from
+    /// the current time stamp and the format. The caller can provide a hint
+    /// output path to the file to override the file name.
+    pub fn output_path(&self, hint: Option<&PathBuf>) -> PathBuf {
+        self.output.clone().unwrap_or_else(|| {
+            use chrono::{offset::Local, DateTime};
+            let file_stem = if let Some(hint) = hint {
+                format!(
+                    "{}",
+                    hint.parent()
+                        .unwrap()
+                        .join(hint.file_stem().unwrap())
+                        .display()
+                )
+            } else {
+                let crate_name = crate::util::get_current_crate_info().name;
+                let time_stamp = std::time::SystemTime::now();
+                let time_stamp: DateTime<Local> = time_stamp.into();
+                let time_stamp = time_stamp.format("%H%M%S");
+                format!("{}-profile-{}", crate_name, time_stamp)
+            };
+            PathBuf::from(format!("{}.{}", file_stem, self.format().file_extension()))
+        })
+    }
 }
 
 #[derive(Debug, Parser)]

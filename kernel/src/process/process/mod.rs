@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use self::timer_manager::PosixTimerManager;
 use super::{
@@ -20,7 +20,7 @@ use crate::{
     device::tty::open_ntty_as_controlling_terminal,
     fs::{file_table::FileTable, fs_resolver::FsResolver, utils::FileCreationMask},
     prelude::*,
-    sched::nice::Nice,
+    sched::priority::{AtomicNice, Nice},
     thread::Thread,
     time::clocks::ProfClock,
     vm::vmar::Vmar,
@@ -34,7 +34,7 @@ mod terminal;
 mod timer_manager;
 
 use aster_rights::Full;
-use atomic::Atomic;
+use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 pub use builder::ProcessBuilder;
 pub use job_control::JobControl;
 use ostd::{sync::WaitQueue, task::Task};
@@ -44,6 +44,10 @@ pub use terminal::Terminal;
 
 /// Process id.
 pub type Pid = u32;
+define_atomic_version_of_integer_like_type!(Pid, {
+    #[derive(Debug)]
+    pub struct AtomicPid(AtomicU32);
+});
 /// Process group id.
 pub type Pgid = u32;
 /// Session Id.
@@ -88,13 +92,16 @@ pub struct Process {
     /// Scheduling priority nice value
     /// According to POSIX.1, the nice value is a per-process attribute,
     /// the threads in a process should share a nice value.
-    nice: Atomic<Nice>,
+    nice: AtomicNice,
 
     // Signal
     /// Sig dispositions
     sig_dispositions: Arc<Mutex<SigDispositions>>,
     /// The signal that the process should receive when parent process exits.
     parent_death_signal: AtomicSigNum,
+
+    /// The signal that should be sent to the parent when this process exits.
+    exit_signal: AtomicSigNum,
 
     /// A profiling clock measures the user CPU time and kernel CPU time of the current process.
     prof_clock: Arc<ProfClock>,
@@ -107,11 +114,11 @@ pub struct Process {
 ///
 /// This type caches the value of the PID so that it can be retrieved cheaply.
 ///
-/// The benefit of using `ParentProcess` over `(Mutex<Weak<Process>>, Atomic<Pid>,)` is to
+/// The benefit of using `ParentProcess` over `(Mutex<Weak<Process>>, AtomicPid,)` is to
 /// enforce the invariant that the cached PID and the weak reference are always kept in sync.
 pub struct ParentProcess {
     process: Mutex<Weak<Process>>,
-    pid: Atomic<Pid>,
+    pid: AtomicPid,
 }
 
 impl ParentProcess {
@@ -123,7 +130,7 @@ impl ParentProcess {
 
         Self {
             process: Mutex::new(process),
-            pid: Atomic::new(pid),
+            pid: AtomicPid::new(pid),
         }
     }
 
@@ -213,8 +220,9 @@ impl Process {
             umask,
             sig_dispositions,
             parent_death_signal: AtomicSigNum::new_empty(),
+            exit_signal: AtomicSigNum::new_empty(),
             resource_limits: Mutex::new(resource_limits),
-            nice: Atomic::new(nice),
+            nice: AtomicNice::new(nice),
             timer_manager: PosixTimerManager::new(&prof_clock, process_ref),
             prof_clock,
         })
@@ -320,7 +328,7 @@ impl Process {
         &self.resource_limits
     }
 
-    pub fn nice(&self) -> &Atomic<Nice> {
+    pub fn nice(&self) -> &AtomicNice {
         &self.nice
     }
 
@@ -329,7 +337,7 @@ impl Process {
             .lock()
             .iter()
             .find(|task| task.tid() == self.pid)
-            .map(Thread::borrow_from_task)
+            .map(|task| Thread::borrow_from_task(task.as_ref()))
             .cloned()
     }
 
@@ -683,6 +691,14 @@ impl Process {
     /// when the process exits.
     pub fn parent_death_signal(&self) -> Option<SigNum> {
         self.parent_death_signal.as_sig_num()
+    }
+
+    pub fn set_exit_signal(&self, sig_num: SigNum) {
+        self.exit_signal.set(sig_num);
+    }
+
+    pub fn exit_signal(&self) -> Option<SigNum> {
+        self.exit_signal.as_sig_num()
     }
 
     // ******************* Status ********************

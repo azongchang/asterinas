@@ -5,6 +5,7 @@ use core::{
     time::Duration,
 };
 
+use align_ext::AlignExt;
 use aster_block::bio::BioWaiter;
 use aster_rights::Full;
 use aster_util::slot_vec::SlotVec;
@@ -66,10 +67,6 @@ impl RamFS {
 
     fn alloc_id(&self) -> u64 {
         self.inode_allocator.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn device_id(&self) -> u64 {
-        0
     }
 }
 
@@ -614,7 +611,7 @@ impl Inode for RamInode {
                 let new_size = offset + write_len;
                 let should_expand_size = new_size > file_size;
                 if should_expand_size {
-                    page_cache.resize(new_size)?;
+                    page_cache.resize(new_size.align_up(BLOCK_SIZE))?;
                 }
                 page_cache.pages().write(offset, reader)?;
 
@@ -782,6 +779,9 @@ impl Inode for RamInode {
     }
 
     fn as_device(&self) -> Option<Arc<dyn Device>> {
+        if !self.typ.is_device() {
+            return None;
+        }
         self.node.read().inner.as_device().cloned()
     }
 
@@ -1145,20 +1145,21 @@ impl Inode for RamInode {
 
     fn metadata(&self) -> Metadata {
         let self_inode = self.node.read();
+        let inode_metadata = &self_inode.metadata;
         Metadata {
-            dev: self.fs.upgrade().unwrap().device_id(),
+            dev: 0,
             ino: self.ino as _,
-            size: self_inode.metadata.size,
+            size: inode_metadata.size,
             blk_size: BLOCK_SIZE,
-            blocks: self_inode.metadata.blocks,
-            atime: self_inode.metadata.atime,
-            mtime: self_inode.metadata.mtime,
-            ctime: self_inode.metadata.ctime,
+            blocks: inode_metadata.blocks,
+            atime: inode_metadata.atime,
+            mtime: inode_metadata.mtime,
+            ctime: inode_metadata.ctime,
             type_: self.typ,
-            mode: self_inode.metadata.mode,
-            nlinks: self_inode.metadata.nlinks,
-            uid: self_inode.metadata.uid,
-            gid: self_inode.metadata.gid,
+            mode: inode_metadata.mode,
+            nlinks: inode_metadata.nlinks,
+            uid: inode_metadata.uid,
+            gid: inode_metadata.gid,
             rdev: {
                 if let Some(device) = self_inode.inner.as_device() {
                     device.id().into()

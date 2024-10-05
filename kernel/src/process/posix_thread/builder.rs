@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use ostd::{task::Task, user::UserSpace};
+use ostd::{cpu::CpuSet, task::Task, user::UserSpace};
 
 use super::{thread_table, PosixThread};
 use crate::{
@@ -12,6 +12,7 @@ use crate::{
         signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
         Credentials, Process,
     },
+    sched::priority::Priority,
     thread::{status::ThreadStatus, task, Thread, Tid},
     time::{clocks::ProfClock, TimerManager},
 };
@@ -111,7 +112,15 @@ impl PosixThreadBuilder {
             };
 
             let status = ThreadStatus::Init;
-            let thread = Arc::new(Thread::new(weak_task.clone(), posix_thread, status));
+            let priority = Priority::default();
+            let cpu_affinity = CpuSet::new_full();
+            let thread = Arc::new(Thread::new(
+                weak_task.clone(),
+                posix_thread,
+                status,
+                priority,
+                cpu_affinity,
+            ));
 
             thread_table::add_thread(tid, thread.clone());
             task::create_new_user_task(user_space, thread)

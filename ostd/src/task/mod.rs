@@ -16,10 +16,10 @@ use processor::current_task;
 
 pub use self::{
     preempt::{disable_preempt, DisabledPreemptGuard},
-    scheduler::info::{AtomicCpuId, Priority, TaskScheduleInfo},
+    scheduler::info::{AtomicCpuId, TaskScheduleInfo},
 };
 pub(crate) use crate::arch::task::{context_switch, TaskContext};
-use crate::{cpu::CpuSet, prelude::*, user::UserSpace};
+use crate::{prelude::*, user::UserSpace};
 
 /// A task that executes a function to the end.
 ///
@@ -32,6 +32,7 @@ pub struct Task {
     user_space: Option<Arc<UserSpace>>,
     ctx: UnsafeCell<TaskContext>,
     /// kernel stack, note that the top is SyscallFrame/TrapFrame
+    #[allow(dead_code)]
     kstack: KernelStack,
 
     schedule_info: TaskScheduleInfo,
@@ -51,6 +52,22 @@ impl Task {
 
     pub(super) fn ctx(&self) -> &UnsafeCell<TaskContext> {
         &self.ctx
+    }
+
+    /// Sets thread-local storage pointer.
+    pub fn set_tls_pointer(&self, tls: usize) {
+        let ctx_ptr = self.ctx.get();
+
+        // SAFETY: it's safe to set user tls pointer in kernel context.
+        unsafe { (*ctx_ptr).set_tls_pointer(tls) }
+    }
+
+    /// Gets thread-local storage pointer.
+    pub fn tls_pointer(&self) -> usize {
+        let ctx_ptr = self.ctx.get();
+
+        // SAFETY: it's safe to get user tls pointer in kernel context.
+        unsafe { (*ctx_ptr).tls_pointer() }
     }
 
     /// Yields execution so that another task may be scheduled.
@@ -107,8 +124,6 @@ pub struct TaskOptions {
     func: Option<Box<dyn Fn() + Send + Sync>>,
     data: Option<Box<dyn Any + Send + Sync>>,
     user_space: Option<Arc<UserSpace>>,
-    priority: Priority,
-    cpu_affinity: CpuSet,
 }
 
 impl TaskOptions {
@@ -121,8 +136,6 @@ impl TaskOptions {
             func: Some(Box::new(func)),
             data: None,
             user_space: None,
-            priority: Priority::normal(),
-            cpu_affinity: CpuSet::new_full(),
         }
     }
 
@@ -150,21 +163,6 @@ impl TaskOptions {
         self
     }
 
-    /// Sets the priority of the task.
-    pub fn priority(mut self, priority: Priority) -> Self {
-        self.priority = priority;
-        self
-    }
-
-    /// Sets the CPU affinity mask for the task.
-    ///
-    /// The `cpu_affinity` parameter represents
-    /// the desired set of CPUs to run the task on.
-    pub fn cpu_affinity(mut self, cpu_affinity: CpuSet) -> Self {
-        self.cpu_affinity = cpu_affinity;
-        self
-    }
-
     /// Builds a new task without running it immediately.
     pub fn build(self) -> Result<Task> {
         /// all task will entering this function
@@ -176,21 +174,14 @@ impl TaskOptions {
             current_task.exit();
         }
 
-        let mut new_task = Task {
-            func: self.func.unwrap(),
-            data: self.data.unwrap(),
-            user_space: self.user_space,
-            ctx: UnsafeCell::new(TaskContext::default()),
-            kstack: KernelStack::new_with_guard_page()?,
-            schedule_info: TaskScheduleInfo {
-                cpu: AtomicCpuId::default(),
-                priority: self.priority,
-                cpu_affinity: self.cpu_affinity,
-            },
-        };
+        let kstack = KernelStack::new_with_guard_page()?;
 
-        let ctx = new_task.ctx.get_mut();
-        ctx.set_instruction_pointer(kernel_task_entry as usize);
+        let mut ctx = UnsafeCell::new(TaskContext::default());
+        if let Some(user_space) = self.user_space.as_ref() {
+            ctx.get_mut().set_tls_pointer(user_space.tls_pointer());
+        };
+        ctx.get_mut()
+            .set_instruction_pointer(kernel_task_entry as usize);
         // We should reserve space for the return address in the stack, otherwise
         // we will write across the page boundary due to the implementation of
         // the context switch.
@@ -199,7 +190,19 @@ impl TaskOptions {
         // to at least 16 bytes. And a larger alignment is needed if larger arguments
         // are passed to the function. The `kernel_task_entry` function does not
         // have any arguments, so we only need to align the stack pointer to 16 bytes.
-        ctx.set_stack_pointer(crate::mm::paddr_to_vaddr(new_task.kstack.end_paddr() - 16));
+        ctx.get_mut()
+            .set_stack_pointer(crate::mm::paddr_to_vaddr(kstack.end_paddr() - 16));
+
+        let new_task = Task {
+            func: self.func.unwrap(),
+            data: self.data.unwrap(),
+            user_space: self.user_space,
+            ctx,
+            kstack,
+            schedule_info: TaskScheduleInfo {
+                cpu: AtomicCpuId::default(),
+            },
+        };
 
         Ok(new_task)
     }
