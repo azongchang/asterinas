@@ -10,7 +10,7 @@ use aster_network::{
     AnyNetworkDevice, EthernetAddr, RxBuffer, TxBuffer, VirtioNetError, RX_BUFFER_POOL,
 };
 use aster_util::slot_vec::SlotVec;
-use log::debug;
+use log::{debug, warn};
 use ostd::{
     mm::DmaStream,
     sync::{LocalIrqDisabled, SpinLock},
@@ -21,11 +21,11 @@ use super::{config::VirtioNetConfig, header::VirtioNetHdr};
 use crate::{
     device::{network::config::NetworkFeatures, VirtioDeviceError},
     queue::{QueueError, VirtQueue},
-    transport::VirtioTransport,
+    transport::{ConfigManager, VirtioTransport},
 };
 
 pub struct NetworkDevice {
-    config: VirtioNetConfig,
+    config_manager: ConfigManager<VirtioNetConfig>,
     // For smoltcp use
     caps: DeviceCapabilities,
     mac_addr: EthernetAddr,
@@ -37,6 +37,22 @@ pub struct NetworkDevice {
     tx_buffers: Vec<Option<TxBuffer>>,
     rx_buffers: SlotVec<RxBuffer>,
     transport: Box<dyn VirtioTransport>,
+    poll_stat: PollStatistics,
+}
+
+/// Structure to track the number of packets sent and received during a single polling process.
+struct PollStatistics {
+    sent_packet: usize,
+    received_packet: usize,
+}
+
+impl PollStatistics {
+    const fn new() -> Self {
+        Self {
+            sent_packet: 0,
+            received_packet: 0,
+        }
+    }
 }
 
 impl NetworkDevice {
@@ -44,25 +60,33 @@ impl NetworkDevice {
         let device_features = NetworkFeatures::from_bits_truncate(device_features);
         let supported_features = NetworkFeatures::support_features();
         let network_features = device_features & supported_features;
+
+        if network_features != device_features {
+            warn!(
+                "Virtio net contains unsupported device features: {:?}",
+                device_features.difference(supported_features)
+            );
+        }
+
         debug!("{:?}", network_features);
         network_features.bits()
     }
 
     pub fn init(mut transport: Box<dyn VirtioTransport>) -> Result<(), VirtioDeviceError> {
-        let virtio_net_config = VirtioNetConfig::new(transport.as_mut());
+        let config_manager = VirtioNetConfig::new_manager(transport.as_ref());
+        let config = config_manager.read_config();
+        debug!("virtio_net_config = {:?}", config);
+        let mac_addr = config.mac;
         let features = NetworkFeatures::from_bits_truncate(Self::negotiate_features(
-            transport.device_features(),
+            transport.read_device_features(),
         ));
-        debug!("virtio_net_config = {:?}", virtio_net_config);
         debug!("features = {:?}", features);
 
-        let config = VirtioNetConfig::read(&virtio_net_config).unwrap();
-        let mac_addr = config.mac;
-        debug!("mac addr = {:x?}, status = {:?}", mac_addr, config.status);
         let caps = init_caps(&features, &config);
 
-        let send_queue = VirtQueue::new(QUEUE_SEND, QUEUE_SIZE, transport.as_mut())
+        let mut send_queue = VirtQueue::new(QUEUE_SEND, QUEUE_SIZE, transport.as_mut())
             .expect("create send queue fails");
+        send_queue.disable_callback();
 
         let mut recv_queue = VirtQueue::new(QUEUE_RECV, QUEUE_SIZE, transport.as_mut())
             .expect("creating recv queue fails");
@@ -73,7 +97,6 @@ impl NetworkDevice {
         for i in 0..QUEUE_SIZE {
             let rx_pool = RX_BUFFER_POOL.get().unwrap();
             let rx_buffer = RxBuffer::new(size_of::<VirtioNetHdr>(), rx_pool);
-            // FIEME: Replace rx_buffer with VM segment-based data structure to use dma mapping.
             let token = recv_queue.add_dma_buf(&[], &[&rx_buffer])?;
             assert_eq!(i, token);
             assert_eq!(rx_buffers.put(rx_buffer) as u16, i);
@@ -85,7 +108,7 @@ impl NetworkDevice {
         }
 
         let mut device = Self {
-            config,
+            config_manager,
             caps,
             mac_addr,
             send_queue,
@@ -94,6 +117,7 @@ impl NetworkDevice {
             tx_buffers,
             rx_buffers,
             transport,
+            poll_stat: PollStatistics::new(),
         };
 
         /// Interrupt handler if network device config space changes
@@ -115,11 +139,11 @@ impl NetworkDevice {
             .unwrap();
         device
             .transport
-            .register_queue_callback(QUEUE_SEND, Box::new(handle_send_event), false)
+            .register_queue_callback(QUEUE_SEND, Box::new(handle_send_event), true)
             .unwrap();
         device
             .transport
-            .register_queue_callback(QUEUE_RECV, Box::new(handle_recv_event), false)
+            .register_queue_callback(QUEUE_RECV, Box::new(handle_recv_event), true)
             .unwrap();
 
         device.transport.finish_init();
@@ -131,22 +155,26 @@ impl NetworkDevice {
         Ok(())
     }
 
-    /// Add a rx buffer to recv queue
-    /// FIEME: Replace rx_buffer with VM segment-based data structure to use dma mapping.
+    /// Adds a `RxBuffer` to the receive queue.
     fn add_rx_buffer(&mut self, rx_buffer: RxBuffer) -> Result<(), VirtioNetError> {
         let token = self
             .recv_queue
             .add_dma_buf(&[], &[&rx_buffer])
             .map_err(queue_to_network_error)?;
         assert!(self.rx_buffers.put_at(token as usize, rx_buffer).is_none());
-        if self.recv_queue.should_notify() {
-            self.recv_queue.notify();
+
+        self.poll_stat.received_packet += 1;
+
+        if self.poll_stat.received_packet == QUEUE_SIZE as _ {
+            // If we know there are no free buffers for receiving,
+            // we will notify the receive queue as soon as possible.
+            self.notify_receive_queue();
         }
+
         Ok(())
     }
 
-    /// Receive a packet from network. If packet is ready, returns a RxBuffer containing the packet.
-    /// Otherwise, return NotReady error.
+    /// Receives a packet from network.
     fn receive(&mut self) -> Result<RxBuffer, VirtioNetError> {
         let (token, len) = self.recv_queue.pop_used().map_err(queue_to_network_error)?;
         debug!("receive packet: token = {}, len = {}", token, len);
@@ -154,7 +182,7 @@ impl NetworkDevice {
             .rx_buffers
             .remove(token as usize)
             .ok_or(VirtioNetError::WrongToken)?;
-        rx_buffer.set_packet_len(len as usize);
+        rx_buffer.set_packet_len(len as usize - size_of::<VirtioNetHdr>());
         // FIXME: Ideally, we can reuse the returned buffer without creating new buffer.
         // But this requires locking device to be compatible with smoltcp interface.
         let rx_pool = RX_BUFFER_POOL.get().unwrap();
@@ -163,8 +191,7 @@ impl NetworkDevice {
         Ok(rx_buffer)
     }
 
-    /// Send a packet to network. Return until the request completes.
-    /// FIEME: Replace tx_buffer with VM segment-based data structure to use dma mapping.
+    /// Sends a packet to network.
     fn send(&mut self, packet: &[u8]) -> Result<(), VirtioNetError> {
         if !self.can_send() {
             return Err(VirtioNetError::Busy);
@@ -176,14 +203,66 @@ impl NetworkDevice {
             .send_queue
             .add_dma_buf(&[&tx_buffer], &[])
             .map_err(queue_to_network_error)?;
-        if self.send_queue.should_notify() {
-            self.send_queue.notify();
+
+        self.poll_stat.sent_packet += 1;
+
+        if self.send_queue.available_desc() == 0 {
+            // If the send queue is full,
+            // we will notify the send queue as soon as possible.
+            self.notify_send_queue();
         }
+
+        debug!("send packet, token = {}, len = {}", token, packet.len());
 
         debug_assert!(self.tx_buffers[token as usize].is_none());
         self.tx_buffers[token as usize] = Some(tx_buffer);
 
+        self.free_processed_tx_buffers();
+
+        // If the send queue is not full, we can free the send buffers during the next sending process.
+        // Therefore, there is no need to free the used buffers in the IRQ handlers.
+        // This allows us to temporarily disable the send queue interrupt.
+        // Conversely, if the send queue is full, the send queue interrupt should remain enabled
+        // to free the send buffers as quickly as possible.
+        if !self.can_send() {
+            self.send_queue.enable_callback();
+        } else {
+            self.send_queue.disable_callback();
+        }
+
         Ok(())
+    }
+
+    fn notify_send_queue(&mut self) {
+        if self.poll_stat.sent_packet == 0 {
+            return;
+        }
+
+        debug!(
+            "notify send queue: sent {} packets",
+            self.poll_stat.sent_packet
+        );
+        if self.send_queue.should_notify() {
+            self.send_queue.notify();
+        }
+
+        self.poll_stat.sent_packet = 0;
+    }
+
+    fn notify_receive_queue(&mut self) {
+        if self.poll_stat.received_packet == 0 {
+            return;
+        }
+
+        debug!(
+            "notify receive queue: received {} packets",
+            self.poll_stat.received_packet
+        );
+        if self.recv_queue.should_notify() {
+            self.recv_queue.notify();
+        }
+
+        self.poll_stat.received_packet = 0;
     }
 }
 
@@ -265,12 +344,17 @@ impl AnyNetworkDevice for NetworkDevice {
             self.tx_buffers[token as usize] = None;
         }
     }
+
+    fn notify_poll_end(&mut self) {
+        self.notify_send_queue();
+        self.notify_receive_queue();
+    }
 }
 
 impl Debug for NetworkDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NetworkDevice")
-            .field("config", &self.config)
+            .field("config", &self.config_manager.read_config())
             .field("mac_addr", &self.mac_addr)
             .field("send_queue", &self.send_queue)
             .field("recv_queue", &self.recv_queue)

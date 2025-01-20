@@ -10,7 +10,7 @@ use crate::{
         SendRecvFlags, SockShutdownCmd,
     },
     prelude::*,
-    process::signal::{Pollee, Poller},
+    process::signal::{PollHandle, Pollee},
     util::{ring_buffer::RingBuffer, MultiRead, MultiWrite},
 };
 
@@ -27,7 +27,8 @@ impl Connected {
         Self {
             connection: SpinLock::new(Connection::new(peer_addr, local_addr.port)),
             id: ConnectionID::new(local_addr, peer_addr),
-            pollee: Pollee::new(IoEvents::empty()),
+            // FIXME: We should reuse `Pollee` from `Init`.
+            pollee: Pollee::new(),
         }
     }
 
@@ -35,7 +36,8 @@ impl Connected {
         Self {
             connection: SpinLock::new(Connection::new_from_info(connecting.info())),
             id: connecting.id(),
-            pollee: Pollee::new(IoEvents::empty()),
+            // FIXME: We should reuse `Pollee` from `Init`.
+            pollee: Pollee::new(),
         }
     }
     pub fn peer_addr(&self) -> VsockSocketAddr {
@@ -54,6 +56,7 @@ impl Connected {
         let mut connection = self.connection.disable_irq().lock();
         let bytes_read = connection.buffer.read_fallible(writer)?;
         connection.info.done_forwarding(bytes_read);
+        self.pollee.invalidate();
 
         match bytes_read {
             0 => {
@@ -69,7 +72,10 @@ impl Connected {
 
     pub fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
         let mut connection = self.connection.disable_irq().lock();
-        debug_assert!(flags.is_all_supported());
+        // TODO: Deal with flags
+        if !flags.is_all_supported() {
+            warn!("unsupported flags: {:?}", flags);
+        }
         let buf_len = reader.sum_lens();
         VSOCK_GLOBAL
             .get()
@@ -116,7 +122,11 @@ impl Connected {
 
     pub fn add_connection_buffer(&self, bytes: &[u8]) -> bool {
         let mut connection = self.connection.disable_irq().lock();
-        connection.add(bytes)
+
+        let result = connection.add(bytes);
+        self.pollee.notify(IoEvents::IN);
+
+        result
     }
 
     pub fn set_peer_requested_shutdown(&self) {
@@ -126,17 +136,19 @@ impl Connected {
             .set_peer_requested_shutdown()
     }
 
-    pub fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
-        self.pollee.poll(mask, poller)
+    pub fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.pollee
+            .poll_with(mask, poller, || self.check_io_events())
     }
 
-    pub fn update_io_events(&self) {
+    fn check_io_events(&self) -> IoEvents {
         let connection = self.connection.disable_irq().lock();
+
         // receive
         if !connection.buffer.is_empty() {
-            self.pollee.add_events(IoEvents::IN);
+            IoEvents::IN
         } else {
-            self.pollee.del_events(IoEvents::IN);
+            IoEvents::empty()
         }
     }
 }

@@ -15,7 +15,6 @@ use inherit_methods_macro::inherit_methods;
 use crate::{
     events::IoEvents,
     fs::{
-        device::Device,
         file_handle::FileLike,
         path::Dentry,
         utils::{
@@ -25,14 +24,17 @@ use crate::{
         },
     },
     prelude::*,
-    process::{signal::Poller, Gid, Uid},
+    process::{
+        signal::{PollHandle, Pollable},
+        Gid, Uid,
+    },
 };
 
 #[derive(Debug)]
 pub struct InodeHandle<R = Rights>(Arc<InodeHandle_>, R);
 
 struct InodeHandle_ {
-    dentry: Arc<Dentry>,
+    dentry: Dentry,
     /// `file_io` is Similar to `file_private` field in `file` structure in linux. If
     /// `file_io` is Some, typical file operations including `read`, `write`, `poll`,
     /// `ioctl` will be provided by `file_io`, instead of `dentry`.
@@ -186,7 +188,7 @@ impl InodeHandle_ {
         Ok(read_cnt)
     }
 
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         if let Some(ref file_io) = self.file_io {
             return file_io.poll(mask, poller);
         }
@@ -354,7 +356,7 @@ impl Debug for InodeHandle_ {
 
 /// Methods for both dyn and static
 impl<R> InodeHandle<R> {
-    pub fn dentry(&self) -> &Arc<Dentry> {
+    pub fn dentry(&self) -> &Dentry {
         &self.0.dentry
     }
 
@@ -389,12 +391,10 @@ impl<R> Drop for InodeHandle<R> {
     }
 }
 
-pub trait FileIo: Send + Sync + 'static {
+pub trait FileIo: Pollable + Send + Sync + 'static {
     fn read(&self, writer: &mut VmWriter) -> Result<usize>;
 
     fn write(&self, reader: &mut VmReader) -> Result<usize>;
-
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents;
 
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<i32> {
         return_errno_with_message!(Errno::EINVAL, "ioctl is not supported");

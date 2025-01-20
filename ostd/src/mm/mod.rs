@@ -14,7 +14,6 @@ pub(crate) mod heap_allocator;
 mod io;
 pub(crate) mod kspace;
 mod offset;
-pub(crate) mod page;
 pub(crate) mod page_prop;
 pub(crate) mod page_table;
 pub mod stat;
@@ -25,7 +24,12 @@ use core::{fmt::Debug, ops::Range};
 
 pub use self::{
     dma::{Daddr, DmaCoherent, DmaDirection, DmaStream, DmaStreamSlice, HasDaddr},
-    frame::{options::FrameAllocOptions, Frame, Segment},
+    frame::{
+        allocator::FrameAllocOptions,
+        segment::{Segment, USegment},
+        untyped::{AnyUFrameMeta, UFrame, UntypedMem},
+        Frame,
+    },
     io::{
         Fallible, FallibleVmRead, FallibleVmWrite, Infallible, PodOnce, VmIo, VmIoOnce, VmReader,
         VmWriter,
@@ -34,7 +38,7 @@ pub use self::{
     vm_space::VmSpace,
 };
 pub(crate) use self::{
-    kspace::paddr_to_vaddr, page::meta::init as init_page_meta, page_prop::PrivilegedPageFlags,
+    frame::meta::init as init_page_meta, kspace::paddr_to_vaddr, page_prop::PrivilegedPageFlags,
     page_table::PageTable,
 };
 use crate::arch::mm::PagingConsts;
@@ -44,7 +48,7 @@ pub type PagingLevel = u8;
 
 /// A minimal set of constants that determines the paging system.
 /// This provides an abstraction over most paging modes in common architectures.
-pub(crate) trait PagingConstsTrait: Clone + Debug + Default + Sync + 'static {
+pub(crate) trait PagingConstsTrait: Clone + Debug + Default + Send + Sync + 'static {
     /// The smallest page size.
     /// This is also the page size at level 1 page tables.
     const BASE_PAGE_SIZE: usize;
@@ -100,9 +104,10 @@ pub(crate) const fn nr_base_per_page<C: PagingConstsTrait>(level: PagingLevel) -
 pub const MAX_USERSPACE_VADDR: Vaddr = 0x0000_8000_0000_0000 - PAGE_SIZE;
 
 /// The kernel address space.
+///
 /// There are the high canonical addresses defined in most 48-bit width
 /// architectures.
-pub(crate) const KERNEL_VADDR_RANGE: Range<Vaddr> = 0xffff_8000_0000_0000..0xffff_ffff_ffff_0000;
+pub const KERNEL_VADDR_RANGE: Range<Vaddr> = 0xffff_8000_0000_0000..0xffff_ffff_ffff_0000;
 
 /// Gets physical address trait
 pub trait HasPaddr {

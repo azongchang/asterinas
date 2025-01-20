@@ -13,7 +13,10 @@ tests="
 clone3/clone_exit_signal
 clone3/clone_no_exit_signal
 clone3/clone_process
+cpu_affinity/cpu_affinity
 execve/execve
+exit/exit_code
+exit/exit_procfs
 eventfd2/eventfd2
 fork/fork
 fork_c/fork
@@ -27,6 +30,7 @@ mmap/mmap_shared_filebacked
 mmap/mmap_readahead
 pthread/pthread_test
 pty/open_pty
+shm/posix_shm
 signal_c/parent_death_signal
 signal_c/signal_test
 "

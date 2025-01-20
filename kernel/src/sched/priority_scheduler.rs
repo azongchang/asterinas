@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::Ordering;
+
 use ostd::{
-    cpu::{num_cpus, CpuSet, PinCurrentCpu},
-    sync::PreemptDisabled,
+    cpu::{num_cpus, CpuId, CpuSet, PinCurrentCpu},
     task::{
+        disable_preempt,
         scheduler::{
             info::CommonSchedInfo, inject_scheduler, EnqueueFlags, LocalRunQueue, Scheduler,
             UpdateFlags,
@@ -13,13 +15,24 @@ use ostd::{
     trap::disable_local,
 };
 
-use super::priority::{Priority, PriorityRange};
+use super::{
+    priority::Priority,
+    stats::{set_stats_from_scheduler, SchedulerStats},
+};
 use crate::{prelude::*, thread::Thread};
 
+#[allow(unused)]
 pub fn init() {
     let preempt_scheduler = Box::new(PreemptScheduler::default());
     let scheduler = Box::<PreemptScheduler<Thread, Task>>::leak(preempt_scheduler);
+
+    // Inject the scheduler into the ostd for actual scheduling work.
     inject_scheduler(scheduler);
+
+    // Set the scheduler into the system for statistics.
+    // We set this after injecting the scheduler into ostd,
+    // so that the loadavg statistics are updated after the scheduler is used.
+    set_stats_from_scheduler(scheduler);
 }
 
 /// The preempt scheduler.
@@ -33,8 +46,8 @@ struct PreemptScheduler<T: PreemptSchedInfo + FromTask<U>, U: CommonSchedInfo> {
 }
 
 impl<T: PreemptSchedInfo + FromTask<U>, U: CommonSchedInfo> PreemptScheduler<T, U> {
-    fn new(nr_cpus: u32) -> Self {
-        let mut rq = Vec::with_capacity(nr_cpus as usize);
+    fn new(nr_cpus: usize) -> Self {
+        let mut rq = Vec::with_capacity(nr_cpus);
         for _ in 0..nr_cpus {
             rq.push(SpinLock::new(PreemptRunQueue::new()));
         }
@@ -42,7 +55,7 @@ impl<T: PreemptSchedInfo + FromTask<U>, U: CommonSchedInfo> PreemptScheduler<T, 
     }
 
     /// Selects a CPU for task to run on for the first time.
-    fn select_cpu(&self, entity: &PreemptSchedEntity<T, U>) -> u32 {
+    fn select_cpu(&self, entity: &PreemptSchedEntity<T, U>) -> CpuId {
         // If the CPU of a runnable task has been set before, keep scheduling
         // the task to that one.
         // TODO: Consider migrating tasks between CPUs for load balancing.
@@ -55,7 +68,7 @@ impl<T: PreemptSchedInfo + FromTask<U>, U: CommonSchedInfo> PreemptScheduler<T, 
         let mut minimum_load = usize::MAX;
 
         for candidate in entity.thread.cpu_affinity().iter() {
-            let rq = self.rq[candidate as usize].lock();
+            let rq = self.rq[candidate.as_usize()].lock();
             // A wild guess measuring the load of a runqueue. We assume that
             // real-time tasks are 4-times as important as normal tasks.
             let load = rq.real_time_entities.len() * 8
@@ -74,24 +87,27 @@ impl<T: PreemptSchedInfo + FromTask<U>, U: CommonSchedInfo> PreemptScheduler<T, 
 impl<T: Sync + Send + PreemptSchedInfo + FromTask<U>, U: Sync + Send + CommonSchedInfo> Scheduler<U>
     for PreemptScheduler<T, U>
 {
-    fn enqueue(&self, task: Arc<U>, flags: EnqueueFlags) -> Option<u32> {
+    fn enqueue(&self, task: Arc<U>, flags: EnqueueFlags) -> Option<CpuId> {
         let entity = PreemptSchedEntity::new(task);
-        let mut still_in_rq = false;
-        let target_cpu = {
-            let mut cpu_id = self.select_cpu(&entity);
-            if let Err(task_cpu_id) = entity.task.cpu().set_if_is_none(cpu_id) {
-                debug_assert!(flags != EnqueueFlags::Spawn);
-                still_in_rq = true;
-                cpu_id = task_cpu_id;
-            }
 
-            cpu_id
+        let (still_in_rq, target_cpu) = {
+            let selected_cpu_id = self.select_cpu(&entity);
+
+            if let Err(task_cpu_id) = entity.task.cpu().set_if_is_none(selected_cpu_id) {
+                debug_assert!(flags != EnqueueFlags::Spawn);
+                (true, task_cpu_id)
+            } else {
+                (false, selected_cpu_id)
+            }
         };
 
-        let mut rq = self.rq[target_cpu as usize].disable_irq().lock();
+        let mut rq = self.rq[target_cpu.as_usize()].disable_irq().lock();
         if still_in_rq && let Err(_) = entity.task.cpu().set_if_is_none(target_cpu) {
             return None;
         }
+
+        let new_priority = entity.thread.priority();
+
         if entity.thread.is_real_time() {
             rq.real_time_entities.push_back(entity);
         } else if entity.thread.is_lowest() {
@@ -100,20 +116,53 @@ impl<T: Sync + Send + PreemptSchedInfo + FromTask<U>, U: Sync + Send + CommonSch
             rq.normal_entities.push_back(entity);
         }
 
-        Some(target_cpu)
+        // Preempt the current task, but only if the newly queued task has a strictly higher
+        // priority (i.e., a lower value returned by the `priority` method) than the current task.
+        if rq
+            .current
+            .as_ref()
+            .is_some_and(|current| new_priority < current.thread.priority())
+        {
+            Some(target_cpu)
+        } else {
+            None
+        }
     }
 
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue<U>)) {
         let irq_guard = disable_local();
-        let local_rq: &PreemptRunQueue<T, U> = &self.rq[irq_guard.current_cpu() as usize].lock();
+        let local_rq: &PreemptRunQueue<T, U> = &self.rq[irq_guard.current_cpu().as_usize()].lock();
         f(local_rq);
     }
 
     fn local_mut_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue<U>)) {
         let irq_guard = disable_local();
         let local_rq: &mut PreemptRunQueue<T, U> =
-            &mut self.rq[irq_guard.current_cpu() as usize].lock();
+            &mut self.rq[irq_guard.current_cpu().as_usize()].lock();
         f(local_rq);
+    }
+}
+
+impl<T: Sync + Send + PreemptSchedInfo + FromTask<U>, U: Sync + Send + CommonSchedInfo>
+    SchedulerStats for PreemptScheduler<T, U>
+{
+    fn nr_queued_and_running(&self) -> (u32, u32) {
+        let _preempt_guard = disable_preempt();
+        let mut nr_queued = 0;
+        let mut nr_running = 0;
+
+        for rq in self.rq.iter() {
+            let rq = rq.lock();
+
+            nr_queued +=
+                rq.real_time_entities.len() + rq.normal_entities.len() + rq.lowest_entities.len();
+
+            if rq.current.is_some() {
+                nr_running += 1;
+            }
+        }
+
+        (nr_queued as u32, nr_running)
     }
 }
 
@@ -250,15 +299,15 @@ impl Default for TimeSlice {
 }
 
 impl PreemptSchedInfo for Thread {
-    const REAL_TIME_TASK_PRIORITY: Priority = Priority::new(PriorityRange::new(100));
-    const LOWEST_TASK_PRIORITY: Priority = Priority::new(PriorityRange::new(PriorityRange::MAX));
+    const REAL_TIME_TASK_PRIORITY: Priority = Priority::default_real_time();
+    const LOWEST_TASK_PRIORITY: Priority = Priority::idle();
 
     fn priority(&self) -> Priority {
-        self.priority()
+        self.atomic_priority().load(Ordering::Relaxed)
     }
 
-    fn cpu_affinity(&self) -> SpinLockGuard<CpuSet, PreemptDisabled> {
-        self.lock_cpu_affinity()
+    fn cpu_affinity(&self) -> CpuSet {
+        self.atomic_cpu_affinity().load()
     }
 }
 
@@ -268,7 +317,7 @@ trait PreemptSchedInfo {
 
     fn priority(&self) -> Priority;
 
-    fn cpu_affinity(&self) -> SpinLockGuard<CpuSet, PreemptDisabled>;
+    fn cpu_affinity(&self) -> CpuSet;
 
     fn is_real_time(&self) -> bool {
         self.priority() < Self::REAL_TIME_TASK_PRIORITY

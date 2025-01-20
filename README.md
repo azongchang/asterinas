@@ -7,7 +7,7 @@
     <br/>
 </p>
 
-English | [中文版](README_CN.md)
+English | [中文版](README_CN.md) | [日本語](README_JP.md)
 
 ## Introducing Asterinas
 
@@ -52,7 +52,7 @@ git clone https://github.com/asterinas/asterinas
 2. Run a Docker container as the development environment.
 
 ```bash
-docker run -it --privileged --network=host --device=/dev/kvm -v $(pwd)/asterinas:/root/asterinas asterinas/asterinas:0.9.0
+docker run -it --privileged --network=host --device=/dev/kvm -v $(pwd)/asterinas:/root/asterinas asterinas/asterinas:0.11.1
 ```
 
 3. Inside the container, go to the project folder to build and run Asterinas.

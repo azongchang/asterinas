@@ -22,7 +22,7 @@ mod test {
         BlockDevice, BlockDeviceMeta,
     };
     use ostd::{
-        mm::{FrameAllocOptions, Segment, VmIo},
+        mm::{FrameAllocOptions, Segment, VmIo, PAGE_SIZE},
         prelude::*,
     };
     use rand::{rngs::SmallRng, RngCore, SeedableRng};
@@ -40,15 +40,15 @@ mod test {
 
     /// Followings are implementations of memory simulated block device
     pub const SECTOR_SIZE: usize = 512;
-    struct ExfatMemoryBioQueue(Segment);
+    struct ExfatMemoryBioQueue(Segment<()>);
 
     impl ExfatMemoryBioQueue {
-        pub fn new(segment: Segment) -> Self {
+        pub fn new(segment: Segment<()>) -> Self {
             ExfatMemoryBioQueue(segment)
         }
 
         pub fn sectors_count(&self) -> usize {
-            self.0.nframes() * (PAGE_SIZE / SECTOR_SIZE)
+            self.0.size() / SECTOR_SIZE
         }
     }
 
@@ -57,7 +57,7 @@ mod test {
     }
 
     impl ExfatMemoryDisk {
-        pub fn new(segment: Segment) -> Self {
+        pub fn new(segment: Segment<()>) -> Self {
             ExfatMemoryDisk {
                 queue: ExfatMemoryBioQueue::new(segment),
             }
@@ -83,6 +83,7 @@ mod test {
             for seg in bio.segments() {
                 let size = match bio.type_() {
                     BioType::Read => seg
+                        .inner_segment()
                         .writer()
                         .write(&mut self.queue.0.reader().skip(cur_device_ofs)),
                     BioType::Write => self
@@ -90,7 +91,7 @@ mod test {
                         .0
                         .writer()
                         .skip(cur_device_ofs)
-                        .write(&mut seg.reader()),
+                        .write(&mut seg.inner_segment().reader()),
                     _ => 0,
                 };
                 cur_device_ofs += size;
@@ -110,23 +111,20 @@ mod test {
     static EXFAT_IMAGE: &[u8] = include_bytes!("../../../../test/build/exfat.img");
 
     /// Read exfat disk image
-    fn new_vm_segment_from_image() -> Segment {
-        let vm_segment = {
-            FrameAllocOptions::new(EXFAT_IMAGE.len() / PAGE_SIZE)
-                .is_contiguous(true)
-                .uninit(true)
-                .alloc_contiguous()
-                .unwrap()
-        };
+    fn new_vm_segment_from_image() -> Segment<()> {
+        let segment = FrameAllocOptions::new()
+            .zeroed(false)
+            .alloc_segment(EXFAT_IMAGE.len().div_ceil(PAGE_SIZE))
+            .unwrap();
 
-        vm_segment.write_bytes(0, EXFAT_IMAGE).unwrap();
-        vm_segment
+        segment.write_bytes(0, EXFAT_IMAGE).unwrap();
+        segment
     }
 
     // Generate a simulated exfat file system
     fn load_exfat() -> Arc<ExfatFS> {
-        let vm_segment = new_vm_segment_from_image();
-        let disk = ExfatMemoryDisk::new(vm_segment);
+        let segment = new_vm_segment_from_image();
+        let disk = ExfatMemoryDisk::new(segment);
         let mount_option = ExfatMountOptions::default();
         let fs = ExfatFS::open(Arc::new(disk), mount_option);
         assert!(fs.is_ok(), "Fs failed to init:{:?}", fs.unwrap_err());
@@ -701,7 +699,7 @@ mod test {
         }
 
         let steps = 7;
-        let write_len = (BUF_SIZE + steps - 1) / steps;
+        let write_len = BUF_SIZE.div_ceil(steps);
         for i in 0..steps {
             let start = i * write_len;
             let end = BUF_SIZE.min(start + write_len);

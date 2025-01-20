@@ -9,16 +9,17 @@
 #![allow(incomplete_features)]
 #![feature(btree_cursors)]
 #![feature(btree_extract_if)]
-#![feature(const_option)]
+#![feature(debug_closure_helpers)]
 #![feature(extend_one)]
 #![feature(fn_traits)]
 #![feature(format_args_nl)]
 #![feature(int_roundings)]
-#![feature(iter_repeat_n)]
 #![feature(let_chains)]
-#![feature(linkage)]
+#![feature(linked_list_cursors)]
 #![feature(linked_list_remove)]
+#![feature(linked_list_retain)]
 #![feature(negative_impls)]
+#![feature(panic_can_unwind)]
 #![feature(register_tool)]
 // FIXME: This feature is used to support vm capbility now as a work around.
 // Since this is an incomplete feature, use this feature is unsafe.
@@ -27,27 +28,20 @@
 #![feature(step_trait)]
 #![feature(trait_alias)]
 #![feature(trait_upcasting)]
-#![feature(linked_list_retain)]
-#![feature(linked_list_cursors)]
 #![register_tool(component_access_control)]
 
-use core::sync::atomic::Ordering;
-
+use kcmdline::KCmdlineArg;
 use ostd::{
     arch::qemu::{exit_qemu, QemuExitCode},
-    boot,
-    cpu::PinCurrentCpu,
+    boot::boot_info,
+    cpu::{CpuId, CpuSet, PinCurrentCpu},
 };
 use process::Process;
-use sched::priority::PriorityRange;
 
 use crate::{
     prelude::*,
     sched::priority::Priority,
-    thread::{
-        kernel_thread::{KernelThreadExt, ThreadOptions},
-        Thread,
-    },
+    thread::{kernel_thread::ThreadOptions, Thread},
 };
 
 extern crate alloc;
@@ -58,7 +52,6 @@ extern crate controlled;
 extern crate getset;
 
 pub mod arch;
-pub mod console;
 pub mod context;
 pub mod cpu;
 pub mod device;
@@ -67,13 +60,12 @@ pub mod error;
 pub mod events;
 pub mod fs;
 pub mod ipc;
+pub mod kcmdline;
 pub mod net;
 pub mod prelude;
 mod process;
 mod sched;
-pub mod softirq_id;
 pub mod syscall;
-mod taskless;
 pub mod thread;
 pub mod time;
 mod util;
@@ -86,18 +78,17 @@ pub fn main() {
     ostd::early_println!("[kernel] OSTD initialized. Preparing components.");
     component::init_all(component::parse_metadata!()).unwrap();
     init();
-    ostd::IN_BOOTSTRAP_CONTEXT.store(false, Ordering::Relaxed);
 
     // Spawn all AP idle threads.
     ostd::boot::smp::register_ap_entry(ap_init);
 
     // Spawn the first kernel thread on BSP.
-    Thread::spawn_kernel_thread(
-        ThreadOptions::new(init_thread)
-            .priority(Priority::new(PriorityRange::new(PriorityRange::MAX))),
-    );
-    // Spawning functions in the bootstrap context will not return.
-    unreachable!()
+    let mut affinity = CpuSet::new_empty();
+    affinity.add(CpuId::bsp());
+    ThreadOptions::new(init_thread)
+        .priority(Priority::idle())
+        .cpu_affinity(affinity)
+        .spawn();
 }
 
 pub fn init() {
@@ -107,19 +98,19 @@ pub fn init() {
     #[cfg(target_arch = "x86_64")]
     net::init();
     sched::init();
-    fs::rootfs::init(boot::initramfs()).unwrap();
+    fs::rootfs::init(boot_info().initramfs.expect("No initramfs found!")).unwrap();
     device::init().unwrap();
+    syscall::init();
     vdso::init();
-    taskless::init();
     process::init();
 }
 
-fn ap_init() -> ! {
+fn ap_init() {
     fn ap_idle_thread() {
         let preempt_guard = ostd::task::disable_preempt();
         let cpu_id = preempt_guard.current_cpu();
         drop(preempt_guard);
-        log::info!("Kernel idle thread for CPU #{} started.", cpu_id);
+        log::info!("Kernel idle thread for CPU #{} started.", cpu_id.as_usize());
         loop {
             Thread::yield_now();
         }
@@ -128,13 +119,10 @@ fn ap_init() -> ! {
     let cpu_id = preempt_guard.current_cpu();
     drop(preempt_guard);
 
-    Thread::spawn_kernel_thread(
-        ThreadOptions::new(ap_idle_thread)
-            .cpu_affinity(cpu_id.into())
-            .priority(Priority::new(PriorityRange::new(PriorityRange::MAX))),
-    );
-    // Spawning functions in the bootstrap context will not return.
-    unreachable!()
+    ThreadOptions::new(ap_idle_thread)
+        .cpu_affinity(cpu_id.into())
+        .priority(Priority::idle())
+        .spawn();
 }
 
 fn init_thread() {
@@ -147,14 +135,15 @@ fn init_thread() {
     fs::lazy_init();
     ipc::init();
     // driver::pci::virtio::block::block_device_test();
-    let thread = Thread::spawn_kernel_thread(ThreadOptions::new(|| {
+    let thread = ThreadOptions::new(|| {
         println!("[kernel] Hello world from kernel!");
-    }));
+    })
+    .spawn();
     thread.join();
 
     print_banner();
 
-    let karg = boot::kernel_cmdline();
+    let karg: KCmdlineArg = boot_info().kernel_cmdline.as_str().into();
 
     let initproc = Process::spawn_user_process(
         karg.get_initproc_path().unwrap(),
@@ -163,14 +152,14 @@ fn init_thread() {
     )
     .expect("Run init process failed.");
     // Wait till initproc become zombie.
-    while !initproc.is_zombie() {
+    while !initproc.status().is_zombie() {
         // We don't have preemptive scheduler now.
         // The long running init thread should yield its own execution to allow other tasks to go on.
         Thread::yield_now();
     }
 
     // TODO: exit via qemu isa debug device should not be the only way.
-    let exit_code = if initproc.exit_code() == 0 {
+    let exit_code = if initproc.status().exit_code() == 0 {
         QemuExitCode::Success
     } else {
         QemuExitCode::Failed

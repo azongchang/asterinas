@@ -20,14 +20,10 @@ use core::{
 
 use align_ext::AlignExt;
 use aster_rights::Full;
-use ostd::{
-    mm::{VmIo, MAX_USERSPACE_VADDR},
-    task::Task,
-};
+use ostd::mm::{vm_space::VmItem, UntypedMem, VmIo, VmSpace, MAX_USERSPACE_VADDR};
 
 use self::aux_vec::{AuxKey, AuxVec};
 use crate::{
-    get_current_userspace,
     prelude::*,
     util::random::getrandom,
     vm::{
@@ -125,9 +121,17 @@ impl Clone for InitStack {
 impl InitStack {
     pub(super) fn new() -> Self {
         let nr_pages_padding = {
-            let mut random_nr_pages_padding: u8 = 0;
-            getrandom(random_nr_pages_padding.as_bytes_mut()).unwrap();
-            random_nr_pages_padding as usize
+            // We do not want the stack top too close to MAX_USERSPACE_VADDR.
+            // So we add this fixed padding. Any small value greater than zero will do.
+            const NR_FIXED_PADDING_PAGES: usize = 7;
+
+            // Some random padding pages are added as a simple measure to
+            // make the stack values of a buggy user program harder
+            // to be exploited by attackers.
+            let mut nr_random_padding_pages: u8 = 0;
+            getrandom(nr_random_padding_pages.as_bytes_mut()).unwrap();
+
+            nr_random_padding_pages as usize + NR_FIXED_PADDING_PAGES
         };
         let initial_top = MAX_USERSPACE_VADDR - PAGE_SIZE * nr_pages_padding;
         let max_size = INIT_STACK_SIZE;
@@ -187,10 +191,11 @@ impl InitStack {
 
     /// Constructs a reader to parse the content of an `InitStack`.
     /// The `InitStack` should only be read after initialized
-    pub(super) fn reader(&self) -> InitStackReader {
+    pub(super) fn reader<'a>(&self, vm_space: &'a Arc<VmSpace>) -> InitStackReader<'a> {
         debug_assert!(self.is_initialized());
         InitStackReader {
             base: self.pos(),
+            vm_space,
             map_addr: self.initial_top - self.max_size,
         }
     }
@@ -366,17 +371,32 @@ fn generate_random_for_aux_vec() -> [u8; 16] {
 }
 
 /// A reader to parse the content of an `InitStack`.
-pub struct InitStackReader {
+pub struct InitStackReader<'a> {
     base: Vaddr,
+    vm_space: &'a Arc<VmSpace>,
     /// The mapping address of the `InitStack`.
     map_addr: usize,
 }
 
-impl InitStackReader {
+impl InitStackReader<'_> {
     /// Reads argc from the process init stack
     pub fn argc(&self) -> Result<u64> {
         let stack_base = self.init_stack_bottom();
-        get_current_userspace!().read_val(stack_base)
+        let page_base_addr = stack_base.align_down(PAGE_SIZE);
+
+        let mut cursor = self
+            .vm_space
+            .cursor(&(page_base_addr..page_base_addr + PAGE_SIZE))?;
+        let VmItem::Mapped { frame, .. } = cursor.query()? else {
+            return_errno_with_message!(Errno::EACCES, "Page not accessible");
+        };
+
+        let argc = frame.read_val::<u64>(stack_base - page_base_addr)?;
+        if argc > MAX_ARGV_NUMBER as u64 {
+            return_errno_with_message!(Errno::EINVAL, "argc is corrupted");
+        }
+
+        Ok(argc)
     }
 
     /// Reads argv from the process init stack
@@ -387,15 +407,27 @@ impl InitStackReader {
         let read_offset = self.init_stack_bottom() + size_of::<usize>();
 
         let mut argv = Vec::with_capacity(argc);
+        let page_base_addr = read_offset.align_down(PAGE_SIZE);
+        let mut cursor = self
+            .vm_space
+            .cursor(&(page_base_addr..page_base_addr + PAGE_SIZE))?;
+        let VmItem::Mapped { frame, .. } = cursor.query()? else {
+            return_errno_with_message!(Errno::EACCES, "Page not accessible");
+        };
 
-        let current_task = Task::current().unwrap();
-        let user_space = CurrentUserSpace::new(&current_task);
-
-        let mut argv_reader = user_space.reader(read_offset, argc * size_of::<usize>())?;
+        let mut arg_ptr_reader = frame.reader().skip(read_offset - page_base_addr);
         for _ in 0..argc {
             let arg = {
-                let arg_ptr = argv_reader.read_val::<Vaddr>()?;
-                user_space.read_cstring(arg_ptr, MAX_ARG_LEN)?
+                let arg_ptr = arg_ptr_reader.read_val::<Vaddr>()?;
+                let arg_offset = arg_ptr
+                    .checked_sub(page_base_addr)
+                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "arg_ptr is corrupted"))?;
+                let mut arg_reader = frame
+                    .reader()
+                    .skip(arg_offset)
+                    .to_fallible()
+                    .limit(MAX_ARG_LEN);
+                arg_reader.read_cstring()?
             };
             argv.push(arg);
         }
@@ -417,19 +449,33 @@ impl InitStackReader {
             + size_of::<usize>();
 
         let mut envp = Vec::new();
+        let page_base_addr = read_offset.align_down(PAGE_SIZE);
+        let mut cursor = self
+            .vm_space
+            .cursor(&(page_base_addr..page_base_addr + PAGE_SIZE))?;
+        let VmItem::Mapped { frame, .. } = cursor.query()? else {
+            return_errno_with_message!(Errno::EACCES, "Page not accessible");
+        };
 
-        let current_task = Task::current().unwrap();
-        let user_space = CurrentUserSpace::new(&current_task);
-
-        let mut envp_reader = user_space.reader(read_offset, MAX_ENVP_NUMBER)?;
+        let mut envp_ptr_reader = frame.reader().skip(read_offset - page_base_addr);
         for _ in 0..MAX_ENVP_NUMBER {
-            let envp_ptr = envp_reader.read_val::<Vaddr>()?;
+            let env = {
+                let envp_ptr = envp_ptr_reader.read_val::<Vaddr>()?;
 
-            if envp_ptr == 0 {
-                break;
-            }
+                if envp_ptr == 0 {
+                    break;
+                }
 
-            let env = user_space.read_cstring(envp_ptr, MAX_ENV_LEN)?;
+                let envp_offset = envp_ptr
+                    .checked_sub(page_base_addr)
+                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "envp is corrupted"))?;
+                let mut envp_reader = frame
+                    .reader()
+                    .skip(envp_offset)
+                    .to_fallible()
+                    .limit(MAX_ENV_LEN);
+                envp_reader.read_cstring()?
+            };
             envp.push(env);
         }
 

@@ -9,24 +9,23 @@
 //! powerful concurrent accesses to the page table, and suffers from the same
 //! validity concerns as described in [`super::page_table::cursor`].
 
-use core::{
-    ops::Range,
-    sync::atomic::{AtomicPtr, Ordering},
-};
+use core::{ops::Range, sync::atomic::Ordering};
 
 use crate::{
-    arch::mm::{current_page_table_paddr, PageTableEntry, PagingConsts},
-    cpu::{num_cpus, CpuExceptionInfo, CpuSet, PinCurrentCpu},
-    cpu_local,
+    arch::mm::{
+        current_page_table_paddr, tlb_flush_all_excluding_global, PageTableEntry, PagingConsts,
+    },
+    cpu::{AtomicCpuSet, CpuExceptionInfo, CpuSet, PinCurrentCpu},
+    cpu_local_cell,
     mm::{
         io::Fallible,
         kspace::KERNEL_PAGE_TABLE,
         page_table::{self, PageTable, PageTableItem, UserMode},
         tlb::{TlbFlushOp, TlbFlusher, FLUSH_ALL_RANGE_THRESHOLD},
-        Frame, PageProperty, VmReader, VmWriter, MAX_USERSPACE_VADDR,
+        PageProperty, UFrame, VmReader, VmWriter, MAX_USERSPACE_VADDR,
     },
     prelude::*,
-    sync::{RwLock, RwLockReadGuard},
+    sync::{PreemptDisabled, RwLock, RwLockReadGuard},
     task::{disable_preempt, DisabledPreemptGuard},
     Error,
 };
@@ -41,7 +40,7 @@ use crate::{
 ///
 /// A newly-created `VmSpace` is not backed by any physical memory pages. To
 /// provide memory pages for a `VmSpace`, one can allocate and map physical
-/// memory ([`Frame`]s) to the `VmSpace` using the cursor.
+/// memory ([`UFrame`]s) to the `VmSpace` using the cursor.
 ///
 /// A `VmSpace` can also attach a page fault handler, which will be invoked to
 /// handle page faults generated from user space.
@@ -53,6 +52,7 @@ pub struct VmSpace {
     /// A CPU can only activate a `VmSpace` when no mutable cursors are alive.
     /// Cursors hold read locks and activation require a write lock.
     activation_lock: RwLock<()>,
+    cpus: AtomicCpuSet,
 }
 
 impl VmSpace {
@@ -62,6 +62,36 @@ impl VmSpace {
             pt: KERNEL_PAGE_TABLE.get().unwrap().create_user_page_table(),
             page_fault_handler: None,
             activation_lock: RwLock::new(()),
+            cpus: AtomicCpuSet::new(CpuSet::new_empty()),
+        }
+    }
+
+    /// Clears the user space mappings in the page table.
+    ///
+    /// This method returns error if the page table is activated on any other
+    /// CPUs or there are any cursors alive.
+    pub fn clear(&self) -> core::result::Result<(), VmSpaceClearError> {
+        let preempt_guard = disable_preempt();
+        let _guard = self
+            .activation_lock
+            .try_write()
+            .ok_or(VmSpaceClearError::CursorsAlive)?;
+
+        let cpus = self.cpus.load();
+        let cpu = preempt_guard.current_cpu();
+        let cpus_set_is_empty = cpus.is_empty();
+        let cpus_set_is_single_self = cpus.count() == 1 && cpus.contains(cpu);
+
+        if cpus_set_is_empty || cpus_set_is_single_self {
+            // SAFETY: We have ensured that the page table is not activated on
+            // other CPUs and no cursors are alive.
+            unsafe { self.pt.clear() };
+            if cpus_set_is_single_self {
+                tlb_flush_all_excluding_global();
+            }
+            Ok(())
+        } else {
+            Err(VmSpaceClearError::PageTableActivated(cpus))
         }
     }
 
@@ -91,21 +121,10 @@ impl VmSpace {
         Ok(self.pt.cursor_mut(va).map(|pt_cursor| {
             let activation_lock = self.activation_lock.read();
 
-            let mut activated_cpus = CpuSet::new_empty();
-
-            for cpu in 0..num_cpus() {
-                // The activation lock is held; other CPUs cannot activate this `VmSpace`.
-                let ptr =
-                    ACTIVATED_VM_SPACE.get_on_cpu(cpu).load(Ordering::Relaxed) as *const VmSpace;
-                if ptr == self as *const VmSpace {
-                    activated_cpus.add(cpu);
-                }
-            }
-
             CursorMut {
                 pt_cursor,
                 activation_lock,
-                flusher: TlbFlusher::new(activated_cpus, disable_preempt()),
+                flusher: TlbFlusher::new(self.cpus.load(), disable_preempt()),
             }
         })?)
     }
@@ -113,25 +132,31 @@ impl VmSpace {
     /// Activates the page table on the current CPU.
     pub(crate) fn activate(self: &Arc<Self>) {
         let preempt_guard = disable_preempt();
+        let cpu = preempt_guard.current_cpu();
 
-        // Ensure no mutable cursors (which holds read locks) are alive.
+        let last_ptr = ACTIVATED_VM_SPACE.load();
+
+        if last_ptr == Arc::as_ptr(self) {
+            return;
+        }
+
+        // Ensure no mutable cursors (which holds read locks) are alive before
+        // we add the CPU to the CPU set.
         let _activation_lock = self.activation_lock.write();
 
-        let cpu = preempt_guard.current_cpu();
-        let activated_vm_space = ACTIVATED_VM_SPACE.get_on_cpu(cpu);
+        // Record ourselves in the CPU set and the activated VM space pointer.
+        self.cpus.add(cpu, Ordering::Relaxed);
+        let self_ptr = Arc::into_raw(Arc::clone(self)) as *mut VmSpace;
+        ACTIVATED_VM_SPACE.store(self_ptr);
 
-        let last_ptr = activated_vm_space.load(Ordering::Relaxed) as *const VmSpace;
-
-        if last_ptr != Arc::as_ptr(self) {
-            self.pt.activate();
-            let ptr = Arc::into_raw(Arc::clone(self)) as *mut VmSpace;
-            activated_vm_space.store(ptr, Ordering::Relaxed);
-            if !last_ptr.is_null() {
-                // SAFETY: The pointer is cast from an `Arc` when it's activated
-                // the last time, so it can be restored and only restored once.
-                drop(unsafe { Arc::from_raw(last_ptr) });
-            }
+        if !last_ptr.is_null() {
+            // SAFETY: The pointer is cast from an `Arc` when it's activated
+            // the last time, so it can be restored and only restored once.
+            let last = unsafe { Arc::from_raw(last_ptr) };
+            last.cpus.remove(cpu, Ordering::Relaxed);
         }
+
+        self.pt.activate();
     }
 
     pub(crate) fn handle_page_fault(
@@ -201,6 +226,17 @@ impl Default for VmSpace {
     }
 }
 
+/// An error that may occur when doing [`VmSpace::clear`].
+#[derive(Debug)]
+pub enum VmSpaceClearError {
+    /// The page table is activated on other CPUs.
+    ///
+    /// The activated CPUs detected are contained in the error.
+    PageTableActivated(CpuSet),
+    /// There are still cursors alive.
+    CursorsAlive,
+}
+
 /// The cursor for querying over the VM space without modifying it.
 ///
 /// It exclusively owns a sub-tree of the page table, preventing others from
@@ -247,7 +283,7 @@ impl Cursor<'_> {
 pub struct CursorMut<'a, 'b> {
     pt_cursor: page_table::CursorMut<'a, UserMode, PageTableEntry, PagingConsts>,
     #[allow(dead_code)]
-    activation_lock: RwLockReadGuard<'b, ()>,
+    activation_lock: RwLockReadGuard<'b, (), PreemptDisabled>,
     // We have a read lock so the CPU set in the flusher is always a superset
     // of actual activated CPUs.
     flusher: TlbFlusher<DisabledPreemptGuard>,
@@ -287,7 +323,7 @@ impl CursorMut<'_, '_> {
     /// Map a frame into the current slot.
     ///
     /// This method will bring the cursor to the next slot after the modification.
-    pub fn map(&mut self, frame: Frame, prop: PageProperty) {
+    pub fn map(&mut self, frame: UFrame, prop: PageProperty) {
         let start_va = self.virt_addr();
         // SAFETY: It is safe to map untyped memory into the userspace.
         let old = unsafe { self.pt_cursor.map(frame.into(), prop) };
@@ -332,15 +368,6 @@ impl CursorMut<'_, '_> {
                     }
                     self.flusher
                         .issue_tlb_flush_with(TlbFlushOp::Address(va), page);
-                }
-                PageTableItem::PageTableNode { page } => {
-                    if !self.flusher.need_remote_flush() && tlb_prefer_flush_all {
-                        // Only on single-CPU cases we can drop the page immediately before flushing.
-                        drop(page);
-                        continue;
-                    }
-                    // If we unmap an entire page table node, we prefer directly flushing all TLBs.
-                    self.flusher.issue_tlb_flush_with(TlbFlushOp::All, page);
                 }
                 PageTableItem::NotMapped { .. } => {
                     break;
@@ -423,14 +450,14 @@ impl CursorMut<'_, '_> {
     }
 }
 
-cpu_local! {
+cpu_local_cell! {
     /// The `Arc` pointer to the activated VM space on this CPU. If the pointer
     /// is NULL, it means that the activated page table is merely the kernel
     /// page table.
     // TODO: If we are enabling ASID, we need to maintain the TLB state of each
     // CPU, rather than merely the activated `VmSpace`. When ASID is enabled,
     // the non-active `VmSpace`s can still have their TLB entries in the CPU!
-    static ACTIVATED_VM_SPACE: AtomicPtr<VmSpace> = AtomicPtr::new(core::ptr::null_mut());
+    static ACTIVATED_VM_SPACE: *const VmSpace = core::ptr::null();
 }
 
 /// The result of a query over the VM space.
@@ -448,7 +475,7 @@ pub enum VmItem {
         /// The virtual address of the slot.
         va: Vaddr,
         /// The mapped frame.
-        frame: Frame,
+        frame: UFrame,
         /// The property of the slot.
         prop: PageProperty,
     },
@@ -469,9 +496,6 @@ impl TryFrom<PageTableItem> for VmItem {
             }),
             PageTableItem::MappedUntracked { .. } => {
                 Err("found untracked memory mapped into `VmSpace`")
-            }
-            PageTableItem::PageTableNode { .. } => {
-                unreachable!()
             }
         }
     }

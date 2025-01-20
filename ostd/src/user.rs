@@ -4,7 +4,12 @@
 
 //! User space.
 
-use crate::{cpu::UserContext, mm::VmSpace, prelude::*, task::Task, trap::TrapFrame};
+use crate::{
+    cpu::{FpuState, UserContext},
+    mm::VmSpace,
+    prelude::*,
+    trap::TrapFrame,
+};
 
 /// A user space.
 ///
@@ -54,6 +59,11 @@ impl UserSpace {
     /// Gets thread-local storage pointer.
     pub fn tls_pointer(&self) -> usize {
         self.init_ctx.tls_pointer()
+    }
+
+    /// Gets a reference to the FPU state.
+    pub fn fpu_state(&self) -> &FpuState {
+        self.init_ctx.fpu_state()
     }
 }
 
@@ -112,13 +122,12 @@ pub trait UserContextApi {
 /// }
 /// ```
 pub struct UserMode<'a> {
-    current: Arc<Task>,
     user_space: &'a Arc<UserSpace>,
     context: UserContext,
 }
 
 // An instance of `UserMode` is bound to the current task. So it must not be sent to other tasks.
-impl<'a> !Send for UserMode<'a> {}
+impl !Send for UserMode<'_> {}
 // Note that implementing `!Sync` is unnecessary
 // because entering the user space via `UserMode` requires taking a mutable reference.
 
@@ -126,9 +135,8 @@ impl<'a> UserMode<'a> {
     /// Creates a new `UserMode`.
     pub fn new(user_space: &'a Arc<UserSpace>) -> Self {
         Self {
-            current: Task::current().unwrap(),
             user_space,
-            context: user_space.init_ctx,
+            context: user_space.init_ctx.clone(),
         }
     }
 
@@ -143,11 +151,11 @@ impl<'a> UserMode<'a> {
     /// cause the method to return
     /// and updating the user-mode CPU context,
     /// this method can be invoked again to go back to the user space.
+    #[track_caller]
     pub fn execute<F>(&mut self, has_kernel_event: F) -> ReturnReason
     where
         F: FnMut() -> bool,
     {
-        debug_assert!(Arc::ptr_eq(&self.current, &Task::current().unwrap()));
         crate::task::atomic_mode::might_sleep();
         self.context.execute(has_kernel_event)
     }

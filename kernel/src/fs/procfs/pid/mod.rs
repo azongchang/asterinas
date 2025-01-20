@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use self::{cmdline::CmdlineFileOps, comm::CommFileOps, exe::ExeSymOps, fd::FdDirOps};
+use self::{
+    cmdline::CmdlineFileOps, comm::CommFileOps, exe::ExeSymOps, fd::FdDirOps, task::TaskDirOps,
+};
 use super::template::{DirOps, ProcDir, ProcDirBuilder};
 use crate::{
     events::Observer,
@@ -9,13 +11,16 @@ use crate::{
         utils::{DirEntryVecExt, Inode},
     },
     prelude::*,
-    process::Process,
+    process::{posix_thread::AsPosixThread, Process},
 };
 
 mod cmdline;
 mod comm;
 mod exe;
 mod fd;
+mod stat;
+mod status;
+mod task;
 
 /// Represents the inode at `/proc/[pid]`.
 pub struct PidDirOps(Arc<Process>);
@@ -28,7 +33,8 @@ impl PidDirOps {
             .volatile()
             .build()
             .unwrap();
-        let file_table = process_ref.file_table().lock();
+        let main_thread = process_ref.main_thread();
+        let file_table = main_thread.as_posix_thread().unwrap().file_table().read();
         let weak_ptr = Arc::downgrade(&pid_inode);
         file_table.register_observer(weak_ptr);
         pid_inode
@@ -51,6 +57,9 @@ impl DirOps for PidDirOps {
             "comm" => CommFileOps::new_inode(self.0.clone(), this_ptr.clone()),
             "fd" => FdDirOps::new_inode(self.0.clone(), this_ptr.clone()),
             "cmdline" => CmdlineFileOps::new_inode(self.0.clone(), this_ptr.clone()),
+            "status" => status::StatusFileOps::new_inode(self.0.clone(), this_ptr.clone()),
+            "stat" => stat::StatFileOps::new_inode(self.0.clone(), this_ptr.clone()),
+            "task" => TaskDirOps::new_inode(self.0.clone(), this_ptr.clone()),
             _ => return_errno!(Errno::ENOENT),
         };
         Ok(inode)
@@ -73,6 +82,15 @@ impl DirOps for PidDirOps {
         });
         cached_children.put_entry_if_not_found("cmdline", || {
             CmdlineFileOps::new_inode(self.0.clone(), this_ptr.clone())
+        });
+        cached_children.put_entry_if_not_found("status", || {
+            status::StatusFileOps::new_inode(self.0.clone(), this_ptr.clone())
+        });
+        cached_children.put_entry_if_not_found("stat", || {
+            stat::StatFileOps::new_inode(self.0.clone(), this_ptr.clone())
+        });
+        cached_children.put_entry_if_not_found("task", || {
+            TaskDirOps::new_inode(self.0.clone(), this_ptr.clone())
         });
     }
 }

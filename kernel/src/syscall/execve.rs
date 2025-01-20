@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use aster_rights::WriteOp;
-use ostd::{cpu::UserContext, user::UserContextApi};
+use ostd::{
+    cpu::{FpuState, RawGeneralRegs, UserContext},
+    user::UserContextApi,
+};
 
 use super::{constants::*, SyscallReturn};
 use crate::{
     fs::{
-        file_table::FileDesc,
+        file_table::{get_file_fast, FileDesc},
         fs_resolver::{FsPath, AT_FDCWD},
         path::Dentry,
-        utils::InodeType,
     },
     prelude::*,
     process::{
@@ -58,28 +60,28 @@ fn lookup_executable_file(
     filename: String,
     flags: OpenFlags,
     ctx: &Context,
-) -> Result<Arc<Dentry>> {
-    let fs_resolver = ctx.process.fs().read();
+) -> Result<Dentry> {
     let dentry = if flags.contains(OpenFlags::AT_EMPTY_PATH) && filename.is_empty() {
-        fs_resolver.lookup_from_fd(dfd)
+        let mut file_table = ctx.thread_local.file_table().borrow_mut();
+        let file = get_file_fast!(&mut file_table, dfd);
+        file.as_inode_or_err()?.dentry().clone()
     } else {
+        let fs_resolver = ctx.posix_thread.fs().resolver().read();
         let fs_path = FsPath::new(dfd, &filename)?;
         if flags.contains(OpenFlags::AT_SYMLINK_NOFOLLOW) {
-            let dentry = fs_resolver.lookup_no_follow(&fs_path)?;
-            if dentry.type_() == InodeType::SymLink {
-                return_errno_with_message!(Errno::ELOOP, "the executable file is a symlink");
-            }
-            Ok(dentry)
+            fs_resolver.lookup_no_follow(&fs_path)?
         } else {
-            fs_resolver.lookup(&fs_path)
+            fs_resolver.lookup(&fs_path)?
         }
-    }?;
+    };
+
     check_executable_file(&dentry)?;
+
     Ok(dentry)
 }
 
 fn do_execve(
-    elf_file: Arc<Dentry>,
+    elf_file: Dentry,
     argv_ptr_ptr: Vaddr,
     envp_ptr_ptr: Vaddr,
     ctx: &Context,
@@ -87,9 +89,9 @@ fn do_execve(
 ) -> Result<()> {
     let Context {
         process,
+        thread_local,
         posix_thread,
-        thread: _,
-        task: _,
+        ..
     } = ctx;
 
     let executable_path = elf_file.abs_path();
@@ -104,37 +106,47 @@ fn do_execve(
         Some(ThreadName::new_from_executable_path(&executable_path)?);
     // clear ctid
     // FIXME: should we clear ctid when execve?
-    *posix_thread.clear_child_tid().lock() = 0;
+    thread_local.clear_child_tid().set(0);
 
     // Ensure that the file descriptors with the close-on-exec flag are closed.
-    let closed_files = process.file_table().lock().close_files_on_exec();
+    // FIXME: This is just wrong if the file table is shared with other processes.
+    let closed_files = thread_local
+        .file_table()
+        .borrow()
+        .write()
+        .close_files_on_exec();
     drop(closed_files);
 
     debug!("load program to root vmar");
     let (new_executable_path, elf_load_info) = {
-        let fs_resolver = &*process.fs().read();
+        let fs_resolver = &*posix_thread.fs().resolver().read();
         let process_vm = process.vm();
         load_program_to_vm(process_vm, elf_file.clone(), argv, envp, fs_resolver, 1)?
     };
 
     // After the program has been successfully loaded, the virtual memory of the current process
     // is initialized. Hence, it is necessary to clear the previously recorded robust list.
-    *posix_thread.robust_list().lock() = None;
+    *thread_local.robust_list().borrow_mut() = None;
     debug!("load elf in execve succeeds");
 
-    let credentials = ctx.posix_thread.credentials_mut();
+    let credentials = posix_thread.credentials_mut();
     set_uid_from_elf(process, &credentials, &elf_file)?;
     set_gid_from_elf(process, &credentials, &elf_file)?;
+    credentials.set_keep_capabilities(false);
 
     // set executable path
     process.set_executable_path(new_executable_path);
     // set signal disposition to default
     process.sig_dispositions().lock().inherit();
     // set cpu context to default
-    let default_content = UserContext::default();
-    *user_context.general_regs_mut() = *default_content.general_regs();
-    user_context.set_tls_pointer(default_content.tls_pointer());
-    *user_context.fp_regs_mut() = *default_content.fp_regs();
+    *user_context.general_regs_mut() = RawGeneralRegs::default();
+    user_context.set_tls_pointer(0);
+    *user_context.fpu_state_mut() = FpuState::default();
+    // FIXME: how to reset the FPU state correctly? Before returning to the user space,
+    // the kernel will call `handle_pending_signal`, which may update the CPU states so that
+    // when the kernel switches to the user mode, the control of the CPU will be handed over
+    // to the user-registered signal handlers.
+    user_context.fpu_state().restore();
     // set new entry point
     user_context.set_instruction_pointer(elf_load_info.entry_point() as _);
     debug!("entry_point: 0x{:x}", elf_load_info.entry_point());
@@ -153,7 +165,7 @@ bitflags::bitflags! {
 
 fn read_filename(filename_ptr: Vaddr, ctx: &Context) -> Result<String> {
     let filename = ctx
-        .get_user_space()
+        .user_space()
         .read_cstring(filename_ptr, MAX_FILENAME_LEN)?;
     Ok(filename.into_string().unwrap())
 }
@@ -171,7 +183,7 @@ fn read_cstring_vec(
     }
     let mut read_addr = array_ptr;
     let mut find_null = false;
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     for _ in 0..max_string_number {
         let cstring_ptr = user_space.read_val::<usize>(read_addr)?;
         read_addr += 8;
@@ -193,7 +205,7 @@ fn read_cstring_vec(
 fn set_uid_from_elf(
     current: &Process,
     credentials: &Credentials<WriteOp>,
-    elf_file: &Arc<Dentry>,
+    elf_file: &Dentry,
 ) -> Result<()> {
     if elf_file.mode()?.has_set_uid() {
         let uid = elf_file.owner()?;
@@ -211,7 +223,7 @@ fn set_uid_from_elf(
 fn set_gid_from_elf(
     current: &Process,
     credentials: &Credentials<WriteOp>,
-    elf_file: &Arc<Dentry>,
+    elf_file: &Dentry,
 ) -> Result<()> {
     if elf_file.mode()?.has_set_gid() {
         let gid = elf_file.group()?;

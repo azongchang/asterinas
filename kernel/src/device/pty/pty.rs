@@ -2,7 +2,10 @@
 
 use alloc::format;
 
+use ostd::task::Task;
+
 use crate::{
+    current_userspace,
     device::tty::{line_discipline::LineDiscipline, new_job_control_and_ldisc},
     events::IoEvents,
     fs::{
@@ -13,10 +16,10 @@ use crate::{
         inode_handle::FileIo,
         utils::{AccessMode, Inode, InodeMode, IoctlCmd},
     },
-    get_current_userspace,
     prelude::*,
     process::{
-        signal::{Pollee, Poller},
+        posix_thread::{AsPosixThread, AsThreadLocal},
+        signal::{PollHandle, Pollable, Pollee},
         JobControl, Terminal,
     },
     util::ring_buffer::RingBuffer,
@@ -48,7 +51,7 @@ impl PtyMaster {
             output: ldisc,
             input: SpinLock::new(RingBuffer::new(BUFFER_CAPACITY)),
             job_control,
-            pollee: Pollee::new(IoEvents::OUT),
+            pollee: Pollee::new(),
             weak_self: weak_ref.clone(),
         })
     }
@@ -64,10 +67,14 @@ impl PtyMaster {
     pub(super) fn slave_push_char(&self, ch: u8) {
         let mut input = self.input.disable_irq().lock();
         input.push_overwrite(ch);
-        self.update_state(&input);
+        self.pollee.notify(IoEvents::IN);
     }
 
-    pub(super) fn slave_poll(&self, mask: IoEvents, mut poller: Option<&mut Poller>) -> IoEvents {
+    pub(super) fn slave_poll(
+        &self,
+        mask: IoEvents,
+        mut poller: Option<&mut PollHandle>,
+    ) -> IoEvents {
         let mut poll_status = IoEvents::empty();
 
         let poll_in_mask = mask & IoEvents::IN;
@@ -78,7 +85,9 @@ impl PtyMaster {
 
         let poll_out_mask = mask & IoEvents::OUT;
         if !poll_out_mask.is_empty() {
-            let poll_out_status = self.pollee.poll(poll_out_mask, poller);
+            let poll_out_status = self
+                .pollee
+                .poll_with(poll_out_mask, poller, || self.check_io_events());
             poll_status |= poll_out_status;
         }
 
@@ -89,46 +98,62 @@ impl PtyMaster {
         self.output.buffer_len()
     }
 
-    fn update_state(&self, buf: &RingBuffer<u8>) {
-        if buf.is_empty() {
-            self.pollee.del_events(IoEvents::IN)
-        } else {
-            self.pollee.add_events(IoEvents::IN);
+    fn try_read(&self, writer: &mut VmWriter) -> Result<usize> {
+        let mut input = self.input.disable_irq().lock();
+
+        if input.is_empty() {
+            return_errno_with_message!(Errno::EAGAIN, "the buffer is empty");
         }
+
+        let read_len = input.read_fallible(writer)?;
+        self.pollee.invalidate();
+
+        Ok(read_len)
+    }
+
+    fn check_io_events(&self) -> IoEvents {
+        let input = self.input.disable_irq().lock();
+
+        if !input.is_empty() {
+            IoEvents::IN | IoEvents::OUT
+        } else {
+            IoEvents::OUT
+        }
+    }
+}
+
+impl Pollable for PtyMaster {
+    fn poll(&self, mask: IoEvents, mut poller: Option<&mut PollHandle>) -> IoEvents {
+        let mut poll_status = IoEvents::empty();
+
+        let poll_in_mask = mask & IoEvents::IN;
+        if !poll_in_mask.is_empty() {
+            let poll_in_status = self
+                .pollee
+                .poll_with(poll_in_mask, poller.as_deref_mut(), || {
+                    self.check_io_events()
+                });
+            poll_status |= poll_in_status;
+        }
+
+        let poll_out_mask = mask & IoEvents::OUT;
+        if !poll_out_mask.is_empty() {
+            let poll_out_status = self.output.poll(poll_out_mask, poller);
+            poll_status |= poll_out_status;
+        }
+
+        poll_status
     }
 }
 
 impl FileIo for PtyMaster {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
-        let read_len = writer.avail();
-        // TODO: deal with nonblocking read
-        if read_len == 0 {
+        if !writer.has_avail() {
             return Ok(0);
         }
 
-        let mut poller = Poller::new();
-        loop {
-            let mut input = self.input.disable_irq().lock();
-
-            if input.is_empty() {
-                let events = self.pollee.poll(IoEvents::IN, Some(&mut poller));
-
-                if events.contains(IoEvents::ERR) {
-                    return_errno_with_message!(Errno::EACCES, "unexpected err");
-                }
-
-                if events.is_empty() {
-                    drop(input);
-                    // FIXME: deal with pty read timeout
-                    poller.wait()?;
-                }
-                continue;
-            }
-
-            let read_len = input.read_fallible(writer)?;
-            self.update_state(&input);
-            return Ok(read_len);
-        }
+        // TODO: deal with nonblocking and timeout
+        self.wait_events(IoEvents::IN, None, || self.try_read(writer))
     }
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {
@@ -143,7 +168,7 @@ impl FileIo for PtyMaster {
             });
         }
 
-        self.update_state(&input);
+        self.pollee.notify(IoEvents::IN);
         Ok(write_len)
     }
 
@@ -151,11 +176,11 @@ impl FileIo for PtyMaster {
         match cmd {
             IoctlCmd::TCGETS => {
                 let termios = self.output.termios();
-                get_current_userspace!().write_val(arg, &termios)?;
+                current_userspace!().write_val(arg, &termios)?;
                 Ok(0)
             }
             IoctlCmd::TCSETS => {
-                let termios = get_current_userspace!().read_val(arg)?;
+                let termios = current_userspace!().read_val(arg)?;
                 self.output.set_termios(termios);
                 Ok(0)
             }
@@ -165,11 +190,13 @@ impl FileIo for PtyMaster {
             }
             IoctlCmd::TIOCGPTN => {
                 let idx = self.index();
-                get_current_userspace!().write_val(arg, &idx)?;
+                current_userspace!().write_val(arg, &idx)?;
                 Ok(0)
             }
             IoctlCmd::TIOCGPTPEER => {
-                let current = current!();
+                let current_task = Task::current().unwrap();
+                let posix_thread = current_task.as_posix_thread().unwrap();
+                let thread_local = current_task.as_thread_local().unwrap();
 
                 // TODO: deal with open options
                 let slave = {
@@ -181,7 +208,7 @@ impl FileIo for PtyMaster {
                     let fs_path = FsPath::try_from(slave_name.as_str())?;
 
                     let inode_handle = {
-                        let fs = current.fs().read();
+                        let fs = posix_thread.fs().resolver().read();
                         let flags = AccessMode::O_RDWR as u32;
                         let mode = (InodeMode::S_IRUSR | InodeMode::S_IWUSR).bits();
                         fs.open(&fs_path, flags, mode)?
@@ -190,19 +217,20 @@ impl FileIo for PtyMaster {
                 };
 
                 let fd = {
-                    let mut file_table = current.file_table().lock();
+                    let file_table = thread_local.file_table().borrow();
+                    let mut file_table_locked = file_table.write();
                     // TODO: deal with the O_CLOEXEC flag
-                    file_table.insert(slave, FdFlags::empty())
+                    file_table_locked.insert(slave, FdFlags::empty())
                 };
                 Ok(fd)
             }
             IoctlCmd::TIOCGWINSZ => {
                 let winsize = self.output.window_size();
-                get_current_userspace!().write_val(arg, &winsize)?;
+                current_userspace!().write_val(arg, &winsize)?;
                 Ok(0)
             }
             IoctlCmd::TIOCSWINSZ => {
-                let winsize = get_current_userspace!().read_val(arg)?;
+                let winsize = current_userspace!().read_val(arg)?;
                 self.output.set_window_size(winsize);
                 Ok(0)
             }
@@ -214,12 +242,12 @@ impl FileIo for PtyMaster {
                     );
                 };
                 let fg_pgid = foreground.pgid();
-                get_current_userspace!().write_val(arg, &fg_pgid)?;
+                current_userspace!().write_val(arg, &fg_pgid)?;
                 Ok(0)
             }
             IoctlCmd::TIOCSPGRP => {
                 let pgid = {
-                    let pgid: i32 = get_current_userspace!().read_val(arg)?;
+                    let pgid: i32 = current_userspace!().read_val(arg)?;
                     if pgid < 0 {
                         return_errno_with_message!(Errno::EINVAL, "negative pgid");
                     }
@@ -239,29 +267,11 @@ impl FileIo for PtyMaster {
             }
             IoctlCmd::FIONREAD => {
                 let len = self.input.lock().len() as i32;
-                get_current_userspace!().write_val(arg, &len)?;
+                current_userspace!().write_val(arg, &len)?;
                 Ok(0)
             }
             _ => Ok(0),
         }
-    }
-
-    fn poll(&self, mask: IoEvents, mut poller: Option<&mut Poller>) -> IoEvents {
-        let mut poll_status = IoEvents::empty();
-
-        let poll_in_mask = mask & IoEvents::IN;
-        if !poll_in_mask.is_empty() {
-            let poll_in_status = self.pollee.poll(poll_in_mask, poller.as_deref_mut());
-            poll_status |= poll_in_status;
-        }
-
-        let poll_out_mask = mask & IoEvents::OUT;
-        if !poll_out_mask.is_empty() {
-            let poll_out_status = self.output.poll(poll_out_mask, poller);
-            poll_status |= poll_out_status;
-        }
-
-        poll_status
     }
 }
 
@@ -329,6 +339,12 @@ impl Terminal for PtySlave {
     }
 }
 
+impl Pollable for PtySlave {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.master().slave_poll(mask, poller)
+    }
+}
+
 impl FileIo for PtySlave {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
         let mut buf = vec![0u8; writer.avail()];
@@ -354,10 +370,6 @@ impl FileIo for PtySlave {
         Ok(write_len)
     }
 
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
-        self.master().slave_poll(mask, poller)
-    }
-
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<i32> {
         match cmd {
             IoctlCmd::TCGETS
@@ -378,12 +390,12 @@ impl FileIo for PtySlave {
                 };
 
                 let fg_pgid = foreground.pgid();
-                get_current_userspace!().write_val(arg, &fg_pgid)?;
+                current_userspace!().write_val(arg, &fg_pgid)?;
                 Ok(0)
             }
             IoctlCmd::TIOCSPGRP => {
                 let pgid = {
-                    let pgid: i32 = get_current_userspace!().read_val(arg)?;
+                    let pgid: i32 = current_userspace!().read_val(arg)?;
                     if pgid < 0 {
                         return_errno_with_message!(Errno::EINVAL, "negative pgid");
                     }
@@ -403,7 +415,7 @@ impl FileIo for PtySlave {
             }
             IoctlCmd::FIONREAD => {
                 let buffer_len = self.master().slave_buf_len() as i32;
-                get_current_userspace!().write_val(arg, &buffer_len)?;
+                current_userspace!().write_val(arg, &buffer_len)?;
                 Ok(0)
             }
             _ => Ok(0),

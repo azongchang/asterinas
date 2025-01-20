@@ -3,7 +3,7 @@
 use super::SyscallReturn;
 use crate::{
     fs::{
-        file_table::FileDesc,
+        file_table::{get_file_fast, FileDesc},
         fs_resolver::{FsPath, AT_FDCWD},
         utils::{InodeMode, PATH_MAX},
     },
@@ -13,10 +13,8 @@ use crate::{
 pub fn sys_fchmod(fd: FileDesc, mode: u16, ctx: &Context) -> Result<SyscallReturn> {
     debug!("fd = {}, mode = 0o{:o}", fd, mode);
 
-    let file = {
-        let file_table = ctx.process.file_table().lock();
-        file_table.get_file(fd)?.clone()
-    };
+    let mut file_table = ctx.thread_local.file_table().borrow_mut();
+    let file = get_file_fast!(&mut file_table, fd);
     file.set_mode(InodeMode::from_bits_truncate(mode))?;
     Ok(SyscallReturn::Return(0))
 }
@@ -33,7 +31,7 @@ pub fn sys_fchmodat(
     /* flags: u32, */
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let path = ctx.get_user_space().read_cstring(path_ptr, PATH_MAX)?;
+    let path = ctx.user_space().read_cstring(path_ptr, PATH_MAX)?;
     debug!("dirfd = {}, path = {:?}, mode = 0o{:o}", dirfd, path, mode,);
 
     let dentry = {
@@ -42,7 +40,7 @@ pub fn sys_fchmodat(
             return_errno_with_message!(Errno::ENOENT, "path is empty");
         }
         let fs_path = FsPath::new(dirfd, path.as_ref())?;
-        ctx.process.fs().read().lookup(&fs_path)?
+        ctx.posix_thread.fs().resolver().read().lookup(&fs_path)?
     };
     dentry.set_mode(InodeMode::from_bits_truncate(mode))?;
     Ok(SyscallReturn::Return(0))

@@ -4,7 +4,7 @@
 
 use aster_rights::{Dup, Read, TRights, Write};
 use aster_rights_proc::require;
-use ostd::sync::{RwLockReadGuard, RwLockWriteGuard};
+use ostd::sync::{PreemptDisabled, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{capabilities::CapSet, credentials_::Credentials_, Credentials, Gid, Uid};
 use crate::prelude::*;
@@ -79,6 +79,14 @@ impl<R: TRights> Credentials<R> {
         self.0.fsuid()
     }
 
+    /// Gets keep capabilities flag.
+    ///
+    /// This method requires the `Read` right.
+    #[require(R > Read)]
+    pub fn keep_capabilities(&self) -> bool {
+        self.0.keep_capabilities()
+    }
+
     /// Sets uid. If self is privileged, sets the effective, real, saved-set user ids as `uid`,
     /// Otherwise, sets effective user id as `uid`.
     ///
@@ -137,6 +145,14 @@ impl<R: TRights> Credentials<R> {
     pub fn reset_suid(&self) {
         let euid = self.0.euid();
         self.0.set_suid(euid);
+    }
+
+    /// Sets keep capabilities flag.
+    ///
+    /// This method requires the `Write` right.
+    #[require(R > Write)]
+    pub fn set_keep_capabilities(&self, keep_capabilities: bool) {
+        self.0.set_keep_capabilities(keep_capabilities);
     }
 
     // *********** Gid methods **********
@@ -239,7 +255,7 @@ impl<R: TRights> Credentials<R> {
     ///
     /// This method requires the `Read` right.
     #[require(R > Read)]
-    pub fn groups(&self) -> RwLockReadGuard<BTreeSet<Gid>> {
+    pub fn groups(&self) -> RwLockReadGuard<BTreeSet<Gid>, PreemptDisabled> {
         self.0.groups()
     }
 
@@ -247,7 +263,7 @@ impl<R: TRights> Credentials<R> {
     ///
     /// This method requires the `Write` right.
     #[require(R > Write)]
-    pub fn groups_mut(&self) -> RwLockWriteGuard<BTreeSet<Gid>> {
+    pub fn groups_mut(&self) -> RwLockWriteGuard<BTreeSet<Gid>, PreemptDisabled> {
         self.0.groups_mut()
     }
 

@@ -4,20 +4,26 @@ use crate::{
     fs::{
         fs_resolver::{split_path, FsPath},
         path::Dentry,
-        utils::{InodeMode, InodeType},
+        utils::{InodeMode, InodeType, Permission},
     },
     prelude::*,
+    process::posix_thread::AsPosixThread,
 };
 
-pub fn lookup_socket_file(path: &str) -> Result<Arc<Dentry>> {
+pub fn lookup_socket_file(path: &str) -> Result<Dentry> {
     let dentry = {
-        let current = current!();
-        let fs = current.fs().read();
+        let current = current_thread!();
+        let current = current.as_posix_thread().unwrap();
+        let fs = current.fs().resolver().read();
         let fs_path = FsPath::try_from(path)?;
         fs.lookup(&fs_path)?
     };
 
-    if !dentry.mode()?.is_readable() || !dentry.mode()?.is_writable() {
+    if dentry
+        .inode()
+        .check_permission(Permission::MAY_READ | Permission::MAY_WRITE)
+        .is_err()
+    {
         return_errno_with_message!(Errno::EACCES, "the socket file cannot be read or written")
     }
 
@@ -31,12 +37,13 @@ pub fn lookup_socket_file(path: &str) -> Result<Arc<Dentry>> {
     Ok(dentry)
 }
 
-pub fn create_socket_file(path: &str) -> Result<Arc<Dentry>> {
+pub fn create_socket_file(path: &str) -> Result<Dentry> {
     let (parent_pathname, file_name) = split_path(path);
 
     let parent = {
-        let current = current!();
-        let fs = current.fs().read();
+        let current = current_thread!();
+        let current = current.as_posix_thread().unwrap();
+        let fs = current.fs().resolver().read();
         let parent_path = FsPath::try_from(parent_pathname)?;
         fs.lookup(&parent_path)?
     };

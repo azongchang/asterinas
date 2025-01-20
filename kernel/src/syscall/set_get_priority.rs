@@ -5,7 +5,7 @@ use core::sync::atomic::Ordering;
 use super::SyscallReturn;
 use crate::{
     prelude::*,
-    process::{posix_thread::PosixThreadExt, process_table, Pgid, Pid, Process, Uid},
+    process::{posix_thread::AsPosixThread, process_table, Pgid, Pid, Process, Uid},
     sched::priority::{Nice, NiceRange},
 };
 
@@ -69,15 +69,11 @@ fn get_processes(prio_target: PriorityTarget) -> Result<Vec<Arc<Process>>> {
         }
         PriorityTarget::User(uid) => {
             // Get the processes that are running under the specified user
-            let processes: Vec<Arc<Process>> = process_table::process_table()
+            let processes: Vec<Arc<Process>> = process_table::process_table_mut()
                 .iter()
                 .filter(|process| {
-                    let Some(main_thread) = process.main_thread() else {
-                        return false;
-                    };
-                    let Some(posix_thread) = main_thread.as_posix_thread() else {
-                        return false;
-                    };
+                    let main_thread = process.main_thread();
+                    let posix_thread = main_thread.as_posix_thread().unwrap();
                     uid == posix_thread.credentials().ruid()
                 })
                 .cloned()

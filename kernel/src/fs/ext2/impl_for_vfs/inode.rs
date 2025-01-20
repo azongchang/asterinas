@@ -29,22 +29,7 @@ impl Inode for Ext2Inode {
     }
 
     fn metadata(&self) -> Metadata {
-        Metadata {
-            dev: 0, // TODO: ID of block device
-            ino: self.ino() as _,
-            size: self.file_size() as _,
-            blk_size: self.fs().super_block().block_size(),
-            blocks: self.blocks_count() as _,
-            atime: self.atime(),
-            mtime: self.mtime(),
-            ctime: self.ctime(),
-            type_: self.inode_type(),
-            mode: InodeMode::from(self.file_perm()),
-            nlinks: self.hard_links() as _,
-            uid: Uid::new(self.uid()),
-            gid: Gid::new(self.gid()),
-            rdev: self.device_id(),
-        }
+        self.metadata()
     }
 
     fn atime(&self) -> Duration {
@@ -191,11 +176,15 @@ impl Inode for Ext2Inode {
     }
 
     fn sync_all(&self) -> Result<()> {
-        self.sync_all()
+        self.sync_all()?;
+        self.fs().block_device().sync()?;
+        Ok(())
     }
 
     fn sync_data(&self) -> Result<()> {
-        self.sync_data()
+        self.sync_data()?;
+        self.fs().block_device().sync()?;
+        Ok(())
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

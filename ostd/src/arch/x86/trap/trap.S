@@ -57,6 +57,7 @@ trap_handler_table:
 .section .text
 .global trap_common
 trap_common:
+    cld                     # clear DF before calling/returning to any C function to conform to x86-64 calling convention
     push rax
     mov ax, [rsp + 4*8]     # load cs
     and ax, 0x3             # test
@@ -65,7 +66,7 @@ trap_common:
 __from_user:
     /*
     kernel stack:
-    - ptr to GeneralRegs
+    - ptr to UserContext
     - ss
     - rsp
     - rflags
@@ -79,8 +80,8 @@ __from_user:
     mov rax, [rsp + 6*8]    # rax = user rsp
     mov gs:12, rax          # store user rsp -> scratch at TSS.sp1
 
-    mov rsp, [rsp + 8*8]    # load rsp -> GeneralRegs
-    add rsp, 22*8           # rsp -> top of GeneralRegs
+    mov rsp, [rsp + 8*8]    # load rsp <- UserContext
+    add rsp, 22*8           # rsp -> top of UserContext
     mov rax, gs:4           # rax = kernel stack
 
     # push trap_num, error_code

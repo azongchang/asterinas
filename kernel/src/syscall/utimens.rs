@@ -78,7 +78,7 @@ pub fn sys_utime(pathname_ptr: Vaddr, utimbuf_ptr: Vaddr, ctx: &Context) -> Resu
         pathname_ptr, utimbuf_ptr
     );
     let times = if utimbuf_ptr != 0 {
-        let utimbuf = ctx.get_user_space().read_val::<Utimbuf>(utimbuf_ptr)?;
+        let utimbuf = ctx.user_space().read_val::<Utimbuf>(utimbuf_ptr)?;
         let atime = timespec_t {
             sec: utimbuf.actime,
             nsec: 0,
@@ -109,7 +109,7 @@ struct Utimbuf {
     modtime: i64,
 }
 
-fn vfs_utimes(dentry: &Arc<Dentry>, times: Option<TimeSpecPair>) -> Result<SyscallReturn> {
+fn vfs_utimes(dentry: &Dentry, times: Option<TimeSpecPair>) -> Result<SyscallReturn> {
     let (atime, mtime, ctime) = match times {
         Some(times) => {
             if !times.atime.is_valid() || !times.mtime.is_valid() {
@@ -161,14 +161,14 @@ fn do_utimes(
         String::new()
     } else {
         let cstring = ctx
-            .get_user_space()
+            .user_space()
             .read_cstring(pathname_ptr, MAX_FILENAME_LEN)?;
         cstring.to_string_lossy().into_owned()
     };
     let dentry = {
         // Determine the file system path and the corresponding entry
         let fs_path = FsPath::new(dirfd, pathname.as_ref())?;
-        let fs = ctx.process.fs().read();
+        let fs = ctx.posix_thread.fs().resolver().read();
         if flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {
@@ -211,7 +211,7 @@ fn do_futimesat(
 
 fn read_time_from_user<T: Pod>(time_ptr: Vaddr, ctx: &Context) -> Result<(T, T)> {
     let mut time_addr = time_ptr;
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     let autime = user_space.read_val::<T>(time_addr)?;
     time_addr += core::mem::size_of::<T>();
     let mutime = user_space.read_val::<T>(time_addr)?;

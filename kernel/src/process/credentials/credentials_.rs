@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use ostd::sync::{RwLockReadGuard, RwLockWriteGuard};
+use ostd::sync::{PreemptDisabled, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{group::AtomicGid, user::AtomicUid, Gid, Uid};
 use crate::{
@@ -34,8 +34,8 @@ pub(super) struct Credentials_ {
     supplementary_gids: RwLock<BTreeSet<Gid>>,
 
     /// The Linux capabilities.
+    ///
     /// This is not the capability (in static_cap.rs) enforced on rust objects.
-
     /// Capability that child processes can inherit
     inheritable_capset: AtomicCapSet,
 
@@ -46,6 +46,9 @@ pub(super) struct Credentials_ {
 
     /// Capability that we can actually use
     effective_capset: AtomicCapSet,
+
+    /// Keep capabilities flag
+    keep_capabilities: AtomicBool,
 }
 
 impl Credentials_ {
@@ -67,6 +70,7 @@ impl Credentials_ {
             inheritable_capset: AtomicCapSet::new(capset),
             permitted_capset: AtomicCapSet::new(capset),
             effective_capset: AtomicCapSet::new(capset),
+            keep_capabilities: AtomicBool::new(false),
         }
     }
 
@@ -92,14 +96,34 @@ impl Credentials_ {
         self.fsuid.load(Ordering::Relaxed)
     }
 
+    pub(super) fn keep_capabilities(&self) -> bool {
+        self.keep_capabilities.load(Ordering::Relaxed)
+    }
+
     pub(super) fn set_uid(&self, uid: Uid) {
         if self.is_privileged() {
             self.ruid.store(uid, Ordering::Relaxed);
             self.euid.store(uid, Ordering::Relaxed);
             self.suid.store(uid, Ordering::Relaxed);
+            self.fsuid.store(uid, Ordering::Relaxed);
         } else {
+            // Unprivileged processes can only switch between ruid, euid, suid
+            if uid != self.ruid.load(Ordering::Relaxed)
+                && uid != self.euid.load(Ordering::Relaxed)
+                && uid != self.suid.load(Ordering::Relaxed)
+            {
+                // No permission to set to this UID
+                return;
+            }
             self.euid.store(uid, Ordering::Relaxed);
+            self.fsuid.store(uid, Ordering::Relaxed);
         }
+        if !self.keep_capabilities.load(Ordering::Relaxed) {
+            self.set_permitted_capset(CapSet::empty());
+            self.set_inheritable_capset(CapSet::empty());
+        }
+        // Always clear the effective capabilities when changing the UID
+        self.set_effective_capset(CapSet::empty());
     }
 
     pub(super) fn set_reuid(&self, ruid: Option<Uid>, euid: Option<Uid>) -> Result<()> {
@@ -254,8 +278,10 @@ impl Credentials_ {
             self.rgid.store(gid, Ordering::Relaxed);
             self.egid.store(gid, Ordering::Relaxed);
             self.sgid.store(gid, Ordering::Relaxed);
+            self.fsgid.store(gid, Ordering::Relaxed);
         } else {
             self.egid.store(gid, Ordering::Relaxed);
+            self.fsgid.store(gid, Ordering::Relaxed);
         }
     }
 
@@ -320,6 +346,11 @@ impl Credentials_ {
 
     pub(super) fn set_sgid(&self, sgid: Gid) {
         self.sgid.store(sgid, Ordering::Relaxed);
+    }
+
+    pub(super) fn set_keep_capabilities(&self, keep_capabilities: bool) {
+        self.keep_capabilities
+            .store(keep_capabilities, Ordering::Relaxed);
     }
 
     // For `setregid`, rgid can *NOT* be set to old sgid,
@@ -387,11 +418,11 @@ impl Credentials_ {
 
     //  ******* Supplementary groups methods *******
 
-    pub(super) fn groups(&self) -> RwLockReadGuard<BTreeSet<Gid>> {
+    pub(super) fn groups(&self) -> RwLockReadGuard<BTreeSet<Gid>, PreemptDisabled> {
         self.supplementary_gids.read()
     }
 
-    pub(super) fn groups_mut(&self) -> RwLockWriteGuard<BTreeSet<Gid>> {
+    pub(super) fn groups_mut(&self) -> RwLockWriteGuard<BTreeSet<Gid>, PreemptDisabled> {
         self.supplementary_gids.write()
     }
 
@@ -440,6 +471,7 @@ impl Clone for Credentials_ {
             inheritable_capset: self.inheritable_capset.clone(),
             permitted_capset: self.permitted_capset.clone(),
             effective_capset: self.effective_capset.clone(),
+            keep_capabilities: AtomicBool::new(self.keep_capabilities.load(Ordering::Relaxed)),
         }
     }
 }

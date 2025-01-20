@@ -4,12 +4,9 @@
 
 //! Opened File Handle
 
+use super::inode_handle::InodeHandle;
 use crate::{
-    events::{IoEvents, Observer},
-    fs::{
-        device::Device,
-        utils::{AccessMode, FallocMode, InodeMode, IoctlCmd, Metadata, SeekFrom, StatusFlags},
-    },
+    fs::utils::{AccessMode, FallocMode, InodeMode, IoctlCmd, Metadata, SeekFrom, StatusFlags},
     net::socket::Socket,
     prelude::*,
     process::{signal::Pollable, Gid, Uid},
@@ -54,9 +51,8 @@ pub trait FileLike: Pollable + Send + Sync + Any {
         return_errno_with_message!(Errno::EINVAL, "resize is not supported");
     }
 
-    fn metadata(&self) -> Metadata {
-        panic!("metadata unsupported");
-    }
+    /// Get the metadata that describes this file.
+    fn metadata(&self) -> Metadata;
 
     fn mode(&self) -> Result<InodeMode> {
         return_errno_with_message!(Errno::EINVAL, "mode is not supported");
@@ -102,27 +98,7 @@ pub trait FileLike: Pollable + Send + Sync + Any {
         return_errno_with_message!(Errno::EOPNOTSUPP, "fallocate is not supported");
     }
 
-    fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        return_errno_with_message!(Errno::EINVAL, "register_observer is not supported")
-    }
-
-    #[must_use]
-    fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        None
-    }
-
-    fn as_socket(self: Arc<Self>) -> Option<Arc<dyn Socket>> {
-        None
-    }
-
-    fn as_device(&self) -> Option<Arc<dyn Device>> {
+    fn as_socket(&self) -> Option<&dyn Socket> {
         None
     }
 }
@@ -150,5 +126,16 @@ impl dyn FileLike {
     pub fn write_bytes_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
         let mut reader = VmReader::from(buf).to_fallible();
         self.write_at(offset, &mut reader)
+    }
+
+    pub fn as_socket_or_err(&self) -> Result<&dyn Socket> {
+        self.as_socket()
+            .ok_or_else(|| Error::with_message(Errno::ENOTSOCK, "the file is not a socket"))
+    }
+
+    pub fn as_inode_or_err(&self) -> Result<&InodeHandle> {
+        self.downcast_ref().ok_or_else(|| {
+            Error::with_message(Errno::EINVAL, "the file is not related to an inode")
+        })
     }
 }

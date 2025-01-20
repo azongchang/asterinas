@@ -4,9 +4,7 @@
 
 use ostd::task::Task;
 
-use crate::{
-    get_current_userspace, prelude::*, process::posix_thread::futex::futex_wake, thread::Tid,
-};
+use crate::{current_userspace, prelude::*, process::posix_thread::futex::futex_wake, thread::Tid};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
@@ -45,13 +43,15 @@ impl RobustListHead {
         if self.list_op_pending == 0 {
             None
         } else {
-            Some(self.futex_addr(self.list_op_pending))
+            self.futex_addr(self.list_op_pending)
         }
     }
 
     /// Get the futex address
-    fn futex_addr(&self, entry_ptr: Vaddr) -> Vaddr {
-        (entry_ptr as isize + self.futex_offset) as _
+    fn futex_addr(&self, entry_ptr: Vaddr) -> Option<Vaddr> {
+        self.futex_offset
+            .checked_add(entry_ptr as isize)
+            .map(|result| result as Vaddr)
     }
 }
 
@@ -84,7 +84,7 @@ impl<'a> FutexIter<'a> {
 
 const ROBUST_LIST_LIMIT: isize = 2048;
 
-impl<'a> Iterator for FutexIter<'a> {
+impl Iterator for FutexIter<'_> {
     type Item = Vaddr;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -101,11 +101,11 @@ impl<'a> Iterator for FutexIter<'a> {
                 return None;
             }
             let futex_addr = if self.entry_ptr != self.robust_list.list_op_pending {
-                Some(self.robust_list.futex_addr(self.entry_ptr))
+                self.robust_list.futex_addr(self.entry_ptr)
             } else {
                 None
             };
-            let Ok(robust_list) = get_current_userspace!().read_val::<RobustList>(self.entry_ptr)
+            let Ok(robust_list) = current_userspace!().read_val::<RobustList>(self.entry_ptr)
             else {
                 return None;
             };

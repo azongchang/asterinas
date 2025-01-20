@@ -44,6 +44,7 @@ mod geteuid;
 mod getgid;
 mod getgroups;
 mod getpeername;
+mod getpgid;
 mod getpgrp;
 mod getpid;
 mod getppid;
@@ -93,7 +94,7 @@ mod rt_sigpending;
 mod rt_sigprocmask;
 mod rt_sigreturn;
 mod rt_sigsuspend;
-mod sched_getaffinity;
+mod sched_affinity;
 mod sched_yield;
 mod select;
 mod semctl;
@@ -126,6 +127,7 @@ mod stat;
 mod statfs;
 mod symlink;
 mod sync;
+mod sysinfo;
 mod tgkill;
 mod time;
 mod timer_create;
@@ -144,7 +146,7 @@ mod write;
 /// The first param is the number of parameters,
 /// The second param is the function name of syscall handler,
 /// The third is optional, means the args(if parameter number > 0),
-/// The third is optional, means if cpu ctx is required.
+/// The fourth is optional, means if cpu ctx is required.
 macro_rules! syscall_handler {
     (0, $fn_name: ident, $args: ident, $ctx: expr) => {
         $fn_name($ctx)
@@ -346,8 +348,8 @@ macro_rules! log_syscall_entry {
             let syscall_name_str = stringify!($syscall_name);
             let pid = $crate::current!().pid();
             let tid = {
-                use $crate::process::posix_thread::PosixThreadExt;
-                $crate::current_thread!().tid()
+                use $crate::process::posix_thread::AsPosixThread;
+                $crate::current_thread!().as_posix_thread().unwrap().tid()
             };
             log::info!(
                 "[pid={}][tid={}][id={}][{}]",
@@ -358,4 +360,8 @@ macro_rules! log_syscall_entry {
             );
         }
     };
+}
+
+pub(super) fn init() {
+    uname::init();
 }

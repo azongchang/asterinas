@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #![no_std]
-// The feature `linkage` is required for `ostd::main` to work.
-#![feature(linkage)]
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
@@ -35,13 +34,15 @@ pub fn main() {
 }
 
 fn create_user_space(program: &[u8]) -> UserSpace {
-    let nframes = program.len().align_up(PAGE_SIZE) / PAGE_SIZE;
+    let nbytes = program.len().align_up(PAGE_SIZE);
     let user_pages = {
-        let vm_frames = FrameAllocOptions::new(nframes).alloc().unwrap();
+        let segment = FrameAllocOptions::new()
+            .alloc_segment(nbytes / PAGE_SIZE)
+            .unwrap();
         // Physical memory pages can be only accessed
-        // via the Frame abstraction.
-        vm_frames.write_bytes(0, program).unwrap();
-        vm_frames
+        // via the `UFrame` or `USegment` abstraction.
+        segment.write_bytes(0, program).unwrap();
+        segment
     };
     let user_address_space = {
         const MAP_ADDR: Vaddr = 0x0040_0000; // The map addr for statically-linked executable
@@ -50,12 +51,10 @@ fn create_user_space(program: &[u8]) -> UserSpace {
         // created and manipulated safely through
         // the `VmSpace` abstraction.
         let vm_space = VmSpace::new();
-        let mut cursor = vm_space
-            .cursor_mut(&(MAP_ADDR..MAP_ADDR + nframes * PAGE_SIZE))
-            .unwrap();
+        let mut cursor = vm_space.cursor_mut(&(MAP_ADDR..MAP_ADDR + nbytes)).unwrap();
         let map_prop = PageProperty::new(PageFlags::RWX, CachePolicy::Writeback);
         for frame in user_pages {
-            cursor.map(frame, map_prop);
+            cursor.map(frame.into(), map_prop);
         }
         drop(cursor);
         Arc::new(vm_space)

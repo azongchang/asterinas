@@ -8,7 +8,7 @@ use crate::{
     error::Error,
     events::IoEvents,
     fs::{inode_handle::FileIo, utils::IoctlCmd},
-    process::signal::Poller,
+    process::signal::{PollHandle, Pollable},
 };
 
 const TDX_REPORTDATA_LEN: usize = 64;
@@ -57,6 +57,13 @@ impl From<TdCallError> for Error {
     }
 }
 
+impl Pollable for TdxGuest {
+    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
+        let events = IoEvents::IN | IoEvents::OUT;
+        events & mask
+    }
+}
+
 impl FileIo for TdxGuest {
     fn read(&self, _writer: &mut VmWriter) -> Result<usize> {
         return_errno_with_message!(Errno::EPERM, "Read operation not supported")
@@ -72,24 +79,17 @@ impl FileIo for TdxGuest {
             _ => return_errno_with_message!(Errno::EPERM, "Unsupported ioctl"),
         }
     }
-
-    fn poll(&self, mask: IoEvents, _poller: Option<&mut Poller>) -> IoEvents {
-        let events = IoEvents::IN | IoEvents::OUT;
-        events & mask
-    }
 }
 
 fn handle_get_report(arg: usize) -> Result<i32> {
     const SHARED_BIT: u8 = 51;
     const SHARED_MASK: u64 = 1u64 << SHARED_BIT;
-    let user_space = get_current_userspace!();
+    let current_task = ostd::task::Task::current().unwrap();
+    let user_space = CurrentUserSpace::new(&current_task);
     let user_request: TdxReportRequest = user_space.read_val(arg)?;
 
-    let vm_segment = FrameAllocOptions::new(2)
-        .is_contiguous(true)
-        .alloc_contiguous()
-        .unwrap();
-    let dma_coherent = DmaCoherent::map(vm_segment, false).unwrap();
+    let segment = FrameAllocOptions::new().alloc_segment(2).unwrap();
+    let dma_coherent = DmaCoherent::map(segment.into(), false).unwrap();
     dma_coherent
         .write_bytes(0, &user_request.report_data)
         .unwrap();

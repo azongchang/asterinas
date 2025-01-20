@@ -2,13 +2,17 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use sys::SysDirOps;
+use filesystems::{FileSystemType, FILESYSTEM_TYPES};
 
 use self::{
+    cpuinfo::CpuInfoFileOps,
+    loadavg::LoadAvgFileOps,
     meminfo::MemInfoFileOps,
     pid::PidDirOps,
     self_::SelfSymOps,
+    sys::SysDirOps,
     template::{DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
+    thread_self::ThreadSelfSymOps,
 };
 use crate::{
     events::Observer,
@@ -17,15 +21,33 @@ use crate::{
         utils::{DirEntryVecExt, FileSystem, FsFlags, Inode, SuperBlock, NAME_MAX},
     },
     prelude::*,
-    process::{process_table, process_table::PidEvent, Pid},
+    process::{
+        process_table::{self, PidEvent},
+        Pid,
+    },
 };
 
+mod cpuinfo;
 mod filesystems;
+mod loadavg;
 mod meminfo;
 mod pid;
 mod self_;
 mod sys;
 mod template;
+mod thread_self;
+
+pub(super) fn init() {
+    FILESYSTEM_TYPES.call_once(|| {
+        vec![
+            FileSystemType::new("proc", true),
+            FileSystemType::new("ramfs", true),
+            FileSystemType::new("devpts", true),
+            FileSystemType::new("ext2", false),
+            FileSystemType::new("exfat", false),
+        ]
+    });
+}
 
 /// Magic number.
 const PROC_MAGIC: u64 = 0x9fa0;
@@ -102,10 +124,16 @@ impl DirOps for RootDirOps {
             SelfSymOps::new_inode(this_ptr.clone())
         } else if name == "sys" {
             SysDirOps::new_inode(this_ptr.clone())
+        } else if name == "thread-self" {
+            ThreadSelfSymOps::new_inode(this_ptr.clone())
         } else if name == "filesystems" {
             FileSystemsFileOps::new_inode(this_ptr.clone())
         } else if name == "meminfo" {
             MemInfoFileOps::new_inode(this_ptr.clone())
+        } else if name == "loadavg" {
+            LoadAvgFileOps::new_inode(this_ptr.clone())
+        } else if name == "cpuinfo" {
+            CpuInfoFileOps::new_inode(this_ptr.clone())
         } else if let Ok(pid) = name.parse::<Pid>() {
             let process_ref =
                 process_table::get_process(pid).ok_or_else(|| Error::new(Errno::ENOENT))?;
@@ -123,14 +151,20 @@ impl DirOps for RootDirOps {
         };
         let mut cached_children = this.cached_children().write();
         cached_children.put_entry_if_not_found("self", || SelfSymOps::new_inode(this_ptr.clone()));
+        cached_children.put_entry_if_not_found("thread-self", || {
+            ThreadSelfSymOps::new_inode(this_ptr.clone())
+        });
         cached_children.put_entry_if_not_found("sys", || SysDirOps::new_inode(this_ptr.clone()));
         cached_children.put_entry_if_not_found("filesystems", || {
             FileSystemsFileOps::new_inode(this_ptr.clone())
         });
         cached_children
             .put_entry_if_not_found("meminfo", || MemInfoFileOps::new_inode(this_ptr.clone()));
-
-        for process in process_table::process_table().iter() {
+        cached_children
+            .put_entry_if_not_found("loadavg", || LoadAvgFileOps::new_inode(this_ptr.clone()));
+        cached_children
+            .put_entry_if_not_found("cpuinfo", || CpuInfoFileOps::new_inode(this_ptr.clone()));
+        for process in process_table::process_table_mut().iter() {
             let pid = process.pid().to_string();
             cached_children.put_entry_if_not_found(&pid, || {
                 PidDirOps::new_inode(process.clone(), this_ptr.clone())

@@ -36,6 +36,7 @@ use crate::syscall::{
     getgid::sys_getgid,
     getgroups::sys_getgroups,
     getpeername::sys_getpeername,
+    getpgid::sys_getpgid,
     getpgrp::sys_getpgrp,
     getpid::sys_getpid,
     getppid::sys_getppid,
@@ -71,7 +72,7 @@ use crate::syscall::{
     prctl::sys_prctl,
     pread64::sys_pread64,
     preadv::{sys_preadv, sys_preadv2, sys_readv},
-    prlimit64::sys_prlimit64,
+    prlimit64::{sys_getrlimit, sys_prlimit64, sys_setrlimit},
     pselect6::sys_pselect6,
     pwrite64::sys_pwrite64,
     pwritev::{sys_pwritev, sys_pwritev2, sys_writev},
@@ -86,7 +87,7 @@ use crate::syscall::{
     rt_sigprocmask::sys_rt_sigprocmask,
     rt_sigreturn::sys_rt_sigreturn,
     rt_sigsuspend::sys_rt_sigsuspend,
-    sched_getaffinity::sys_sched_getaffinity,
+    sched_affinity::{sys_sched_getaffinity, sys_sched_setaffinity},
     sched_yield::sys_sched_yield,
     select::sys_select,
     semctl::sys_semctl,
@@ -119,6 +120,7 @@ use crate::syscall::{
     statfs::{sys_fstatfs, sys_statfs},
     symlink::{sys_symlink, sys_symlinkat},
     sync::sys_sync,
+    sysinfo::sys_sysinfo,
     tgkill::sys_tgkill,
     time::sys_time,
     timer_create::{sys_timer_create, sys_timer_delete},
@@ -221,7 +223,9 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_LCHOWN = 94            => sys_lchown(args[..3]);
     SYS_UMASK = 95             => sys_umask(args[..1]);
     SYS_GETTIMEOFDAY = 96      => sys_gettimeofday(args[..1]);
+    SYS_GETRLIMIT = 97         => sys_getrlimit(args[..2]);
     SYS_GETRUSAGE = 98         => sys_getrusage(args[..2]);
+    SYS_SYSINFO = 99           => sys_sysinfo(args[..1]);
     SYS_GETUID = 102           => sys_getuid(args[..0]);
     SYS_GETGID = 104           => sys_getgid(args[..0]);
     SYS_SETUID = 105           => sys_setuid(args[..1]);
@@ -240,6 +244,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_GETRESUID = 118        => sys_getresuid(args[..3]);
     SYS_SETRESGID = 119        => sys_setresgid(args[..3]);
     SYS_GETRESGID = 120        => sys_getresgid(args[..3]);
+    SYS_GETPGID = 121          => sys_getpgid(args[..1]);
     SYS_SETFSUID = 122         => sys_setfsuid(args[..1]);
     SYS_SETFSGID = 123         => sys_setfsgid(args[..1]);
     SYS_GETSID = 124           => sys_getsid(args[..1]);
@@ -256,6 +261,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_SET_PRIORITY = 141     => sys_set_priority(args[..3]);
     SYS_PRCTL = 157            => sys_prctl(args[..5]);
     SYS_ARCH_PRCTL = 158       => sys_arch_prctl(args[..2], &mut user_ctx);
+    SYS_SETRLIMIT = 160        => sys_setrlimit(args[..2]);
     SYS_CHROOT = 161           => sys_chroot(args[..1]);
     SYS_SYNC = 162             => sys_sync(args[..0]);
     SYS_MOUNT = 165            => sys_mount(args[..5]);
@@ -263,6 +269,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_GETTID = 186           => sys_gettid(args[..0]);
     SYS_TIME = 201             => sys_time(args[..1]);
     SYS_FUTEX = 202            => sys_futex(args[..6]);
+    SYS_SCHED_SETAFFINITY = 203 => sys_sched_setaffinity(args[..3]);
     SYS_SCHED_GETAFFINITY = 204 => sys_sched_getaffinity(args[..3]);
     SYS_EPOLL_CREATE = 213     => sys_epoll_create(args[..1]);
     SYS_GETDENTS64 = 217       => sys_getdents64(args[..3]);

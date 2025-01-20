@@ -3,7 +3,7 @@
 use super::SyscallReturn;
 use crate::{
     fs::{
-        file_table::FileDesc,
+        file_table::{get_file_fast, FileDesc},
         fs_resolver::{FsPath, AT_FDCWD},
         utils::Metadata,
     },
@@ -15,13 +15,12 @@ use crate::{
 pub fn sys_fstat(fd: FileDesc, stat_buf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     debug!("fd = {}, stat_buf_addr = 0x{:x}", fd, stat_buf_ptr);
 
-    let file = {
-        let file_table = ctx.process.file_table().lock();
-        file_table.get_file(fd)?.clone()
-    };
+    let mut file_table = ctx.thread_local.file_table().borrow_mut();
+    let file = get_file_fast!(&mut file_table, fd);
 
     let stat = Stat::from(file.metadata());
-    ctx.get_user_space().write_val(stat_buf_ptr, &stat)?;
+    ctx.user_space().write_val(stat_buf_ptr, &stat)?;
+
     Ok(SyscallReturn::Return(0))
 }
 
@@ -46,7 +45,7 @@ pub fn sys_fstatat(
     flags: u32,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     let filename = user_space.read_cstring(filename_ptr, MAX_FILENAME_LEN)?;
     let flags =
         StatFlags::from_bits(flags).ok_or(Error::with_message(Errno::EINVAL, "invalid flags"))?;
@@ -66,7 +65,7 @@ pub fn sys_fstatat(
     let dentry = {
         let filename = filename.to_string_lossy();
         let fs_path = FsPath::new(dirfd, filename.as_ref())?;
-        let fs = ctx.process.fs().read();
+        let fs = ctx.posix_thread.fs().resolver().read();
         if flags.contains(StatFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {

@@ -11,8 +11,11 @@ use log::info;
 use spin::Once;
 
 use crate::{
-    arch::x86::kernel::acpi::ACPI_TABLES, mm::paddr_to_vaddr, sync::SpinLock, trap::IrqLine, Error,
-    Result,
+    arch::{iommu::has_interrupt_remapping, x86::kernel::acpi::ACPI_TABLES},
+    mm::paddr_to_vaddr,
+    sync::SpinLock,
+    trap::IrqLine,
+    Error, Result,
 };
 
 cfg_if! {
@@ -47,6 +50,34 @@ impl IoApic {
         if value.get_bits(0..8) as u8 != 0 {
             return Err(Error::AccessDenied);
         }
+        if has_interrupt_remapping() {
+            let mut handle = irq.inner_irq().bind_remapping_entry().unwrap().lock();
+
+            // Enable irt entry
+            let irt_entry_mut = handle.irt_entry_mut().unwrap();
+            irt_entry_mut.enable_default(irq.num() as u32);
+
+            // Construct remappable format RTE with RTE[48] set.
+            let mut value: u64 = irq.num() as u64 | 0x1_0000_0000_0000;
+
+            // Interrupt index[14:0] is on RTE[63:49] and interrupt index[15] is on RTE[11].
+            value |= ((handle.index() & 0x8000) >> 4) as u64;
+            value |= (handle.index() as u64 & 0x7FFF) << 49;
+
+            self.access.write(
+                Self::TABLE_REG_BASE + 2 * index,
+                value.get_bits(0..32) as u32,
+            );
+            self.access.write(
+                Self::TABLE_REG_BASE + 2 * index + 1,
+                value.get_bits(32..64) as u32,
+            );
+
+            drop(handle);
+            self.irqs.push(irq);
+            return Ok(());
+        }
+
         self.access
             .write(Self::TABLE_REG_BASE + 2 * index, irq.num() as u32);
         self.access.write(Self::TABLE_REG_BASE + 2 * index + 1, 0);
@@ -164,9 +195,8 @@ pub fn init() {
             #[cfg(feature = "cvm_guest")]
             // SAFETY:
             // This is safe because we are ensuring that the `IO_APIC_DEFAULT_ADDRESS` is a valid MMIO address before this operation.
-            // The `IO_APIC_DEFAULT_ADDRESS` is a well-known address used for IO APICs in x86 systems, and it is page-aligned, which is a requirement for the `unprotect_gpa_range` function.
+            // The `IO_APIC_DEFAULT_ADDRESS` is a well-known address used for IO APICs in x86 systems.
             // We are also ensuring that we are only unprotecting a single page.
-            // Therefore, we are not causing any undefined behavior or violating any of the requirements of the `unprotect_gpa_range` function.
             if tdx_is_enabled() {
                 unsafe {
                     tdx_guest::unprotect_gpa_range(IO_APIC_DEFAULT_ADDRESS, 1).unwrap();
@@ -197,6 +227,15 @@ pub fn init() {
             let mut vec = Vec::new();
             for id in 0..apic.io_apics.len() {
                 let io_apic = apic.io_apics.get(id).unwrap();
+                #[cfg(feature = "cvm_guest")]
+                // SAFETY:
+                // This is safe because we are ensuring that the `io_apic.address` is a valid MMIO address before this operation.
+                // We are also ensuring that we are only unprotecting a single page.
+                if tdx_is_enabled() {
+                    unsafe {
+                        tdx_guest::unprotect_gpa_range(io_apic.address as usize, 1).unwrap();
+                    }
+                }
                 let interrupt_base = io_apic.global_system_interrupt_base;
                 let mut io_apic = unsafe { IoApicAccess::new(io_apic.address as usize) };
                 io_apic.set_id(id as u8);

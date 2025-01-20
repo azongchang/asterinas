@@ -7,10 +7,14 @@ use aster_rights::Rights;
 
 use super::SyscallReturn;
 use crate::{
-    fs::{file_handle::FileLike, file_table::FileDesc, inode_handle::InodeHandle},
+    fs::{
+        file_handle::FileLike,
+        file_table::{get_file_fast, FileDesc},
+    },
     prelude::*,
     vm::{
         perms::VmPerms,
+        vmar::is_userspace_vaddr,
         vmo::{VmoOptions, VmoRightsOp},
     },
 };
@@ -42,7 +46,7 @@ fn do_sys_mmap(
     addr: Vaddr,
     len: usize,
     vm_perms: VmPerms,
-    option: MMapOptions,
+    mut option: MMapOptions,
     fd: FileDesc,
     offset: usize,
     ctx: &Context,
@@ -52,7 +56,11 @@ fn do_sys_mmap(
         addr, len, vm_perms, option, fd, offset
     );
 
-    check_option(&option)?;
+    if option.flags.contains(MMapFlags::MAP_FIXED_NOREPLACE) {
+        option.flags.insert(MMapFlags::MAP_FIXED);
+    }
+
+    check_option(addr, &option)?;
 
     if len == 0 {
         return_errno_with_message!(Errno::EINVAL, "mmap len cannot be zero");
@@ -73,6 +81,15 @@ fn do_sys_mmap(
     if addr > isize::MAX as usize - len {
         return_errno_with_message!(Errno::ENOMEM, "mmap (addr + len) too large");
     }
+
+    // On x86, `PROT_WRITE` implies `PROT_READ`.
+    // <https://man7.org/linux/man-pages/man2/mmap.2.html>
+    #[cfg(target_arch = "x86_64")]
+    let vm_perms = if !vm_perms.contains(VmPerms::READ) && vm_perms.contains(VmPerms::WRITE) {
+        vm_perms | VmPerms::READ
+    } else {
+        vm_perms
+    };
 
     let root_vmar = ctx.process.root_vmar();
     let vm_map_options = {
@@ -107,11 +124,9 @@ fn do_sys_mmap(
             }
         } else {
             let vmo = {
-                let file_table = ctx.process.file_table().lock();
-                let file = file_table.get_file(fd)?;
-                let inode_handle = file
-                    .downcast_ref::<InodeHandle>()
-                    .ok_or(Error::with_message(Errno::EINVAL, "no inode"))?;
+                let mut file_table = ctx.thread_local.file_table().borrow_mut();
+                let file = get_file_fast!(&mut file_table, fd);
+                let inode_handle = file.as_inode_or_err()?;
 
                 let access_mode = inode_handle.access_mode();
                 if vm_perms.contains(VmPerms::READ) && !access_mode.is_readable() {
@@ -147,9 +162,13 @@ fn do_sys_mmap(
     Ok(map_addr)
 }
 
-fn check_option(option: &MMapOptions) -> Result<()> {
+fn check_option(addr: Vaddr, option: &MMapOptions) -> Result<()> {
     if option.typ() == MMapType::File {
         return_errno_with_message!(Errno::EINVAL, "Invalid mmap type");
+    }
+
+    if option.flags().contains(MMapFlags::MAP_FIXED) && !is_userspace_vaddr(addr) {
+        return_errno_with_message!(Errno::EINVAL, "Invalid mmap fixed addr");
     }
 
     Ok(())
@@ -218,6 +237,7 @@ impl MMapOptions {
         self.typ
     }
 
+    #[allow(unused)]
     pub fn flags(&self) -> MMapFlags {
         self.flags
     }

@@ -10,8 +10,10 @@ use id_alloc::IdAlloc;
 use spin::Once;
 use x86_64::registers::rflags::{self, RFlags};
 
+use super::iommu::{alloc_irt_entry, has_interrupt_remapping, IrtEntryHandle};
 use crate::{
-    sync::{Mutex, PreemptDisabled, SpinLock, SpinLockGuard},
+    cpu::CpuId,
+    sync::{LocalIrqDisabled, Mutex, PreemptDisabled, RwLock, RwLockReadGuard, SpinLock},
     trap::TrapFrame,
 };
 
@@ -25,7 +27,8 @@ pub(crate) fn init() {
     for i in 0..256 {
         list.push(IrqLine {
             irq_num: i as u8,
-            callback_list: SpinLock::new(Vec::new()),
+            callback_list: RwLock::new(Vec::new()),
+            bind_remapping_entry: Once::new(),
         });
     }
     IRQ_LIST.call_once(|| list);
@@ -68,7 +71,7 @@ pub struct CallbackElement {
 
 impl CallbackElement {
     pub fn call(&self, element: &TrapFrame) {
-        self.function.call((element,));
+        (self.function)(element);
     }
 }
 
@@ -84,7 +87,8 @@ impl Debug for CallbackElement {
 #[derive(Debug)]
 pub(crate) struct IrqLine {
     pub(crate) irq_num: u8,
-    pub(crate) callback_list: SpinLock<Vec<CallbackElement>>,
+    pub(crate) callback_list: RwLock<Vec<CallbackElement>>,
+    bind_remapping_entry: Once<Arc<SpinLock<IrtEntryHandle, LocalIrqDisabled>>>,
 }
 
 impl IrqLine {
@@ -96,7 +100,18 @@ impl IrqLine {
     /// considered a dangerous operation.
     #[allow(clippy::redundant_allocation)]
     pub unsafe fn acquire(irq_num: u8) -> Arc<&'static Self> {
-        Arc::new(IRQ_LIST.get().unwrap().get(irq_num as usize).unwrap())
+        let irq = Arc::new(IRQ_LIST.get().unwrap().get(irq_num as usize).unwrap());
+        if has_interrupt_remapping() {
+            let handle = alloc_irt_entry();
+            if let Some(handle) = handle {
+                irq.bind_remapping_entry.call_once(|| handle);
+            }
+        }
+        irq
+    }
+
+    pub fn bind_remapping_entry(&self) -> Option<&Arc<SpinLock<IrtEntryHandle, LocalIrqDisabled>>> {
+        self.bind_remapping_entry.get()
     }
 
     /// Gets the IRQ number.
@@ -106,8 +121,8 @@ impl IrqLine {
 
     pub fn callback_list(
         &self,
-    ) -> SpinLockGuard<alloc::vec::Vec<CallbackElement>, PreemptDisabled> {
-        self.callback_list.lock()
+    ) -> RwLockReadGuard<alloc::vec::Vec<CallbackElement>, PreemptDisabled> {
+        self.callback_list.read()
     }
 
     /// Registers a callback that will be invoked when the IRQ is active.
@@ -121,7 +136,7 @@ impl IrqLine {
         F: Fn(&TrapFrame) + Sync + Send + 'static,
     {
         let allocated_id = CALLBACK_ID_ALLOCATOR.get().unwrap().lock().alloc().unwrap();
-        self.callback_list.lock().push(CallbackElement {
+        self.callback_list.write().push(CallbackElement {
             function: Box::new(callback),
             id: allocated_id,
         });
@@ -150,7 +165,7 @@ impl Drop for IrqCallbackHandle {
             .get(self.irq_num as usize)
             .unwrap()
             .callback_list
-            .lock();
+            .write();
         a.retain(|item| item.id != self.id);
         CALLBACK_ID_ALLOCATOR.get().unwrap().lock().free(self.id);
     }
@@ -162,11 +177,11 @@ impl Drop for IrqCallbackHandle {
 ///
 /// The caller must ensure that the CPU ID and the interrupt number corresponds
 /// to a safe function to call.
-pub(crate) unsafe fn send_ipi(cpu_id: u32, irq_num: u8) {
+pub(crate) unsafe fn send_ipi(cpu_id: CpuId, irq_num: u8) {
     use crate::arch::kernel::apic::{self, Icr};
 
     let icr = Icr::new(
-        apic::ApicId::from(cpu_id),
+        apic::ApicId::from(cpu_id.as_usize() as u32),
         apic::DestinationShorthand::NoShorthand,
         apic::TriggerMode::Edge,
         apic::Level::Assert,

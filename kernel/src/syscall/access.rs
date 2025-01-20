@@ -5,7 +5,7 @@ use crate::{
     fs::{
         file_table::FileDesc,
         fs_resolver::{FsPath, AT_FDCWD},
-        utils::PATH_MAX,
+        utils::{Permission, PATH_MAX},
     },
     prelude::*,
 };
@@ -60,7 +60,7 @@ pub fn do_faccessat(
     let flags = FaccessatFlags::from_bits(flags)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "Invalid flags"))?;
 
-    let path = ctx.get_user_space().read_cstring(path_ptr, PATH_MAX)?;
+    let path = ctx.user_space().read_cstring(path_ptr, PATH_MAX)?;
     debug!(
         "dirfd = {}, path = {:?}, mode = {:o}, flags = {:?}",
         dirfd, path, mode, flags
@@ -69,7 +69,7 @@ pub fn do_faccessat(
     let dentry = {
         let path = path.to_string_lossy();
         let fs_path = FsPath::new(dirfd, path.as_ref())?;
-        let fs = ctx.process.fs().read();
+        let fs = ctx.posix_thread.fs().resolver().read();
         if flags.contains(FaccessatFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {
@@ -81,19 +81,19 @@ pub fn do_faccessat(
         return Ok(SyscallReturn::Return(0));
     }
 
-    let inode_mode = dentry.mode()?;
+    let inode = dentry.inode();
 
     // FIXME: The current implementation is dummy
-    if mode.contains(AccessMode::R_OK) && !inode_mode.is_readable() {
-        return_errno_with_message!(Errno::EACCES, "Read permission denied");
+    if mode.contains(AccessMode::R_OK) {
+        inode.check_permission(Permission::MAY_READ)?;
     }
 
-    if mode.contains(AccessMode::W_OK) && !inode_mode.is_writable() {
-        return_errno_with_message!(Errno::EACCES, "Write permission denied");
+    if mode.contains(AccessMode::W_OK) {
+        inode.check_permission(Permission::MAY_WRITE)?;
     }
 
-    if mode.contains(AccessMode::X_OK) && !inode_mode.is_executable() {
-        return_errno_with_message!(Errno::EACCES, "Execute permission denied");
+    if mode.contains(AccessMode::X_OK) {
+        inode.check_permission(Permission::MAY_EXEC)?;
     }
 
     Ok(SyscallReturn::Return(0))

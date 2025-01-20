@@ -14,6 +14,7 @@ pub mod pipe;
 pub mod procfs;
 pub mod ramfs;
 pub mod rootfs;
+pub mod thread_info;
 pub mod utils;
 
 use aster_block::BlockDevice;
@@ -26,7 +27,6 @@ use crate::{
         fs_resolver::FsPath,
     },
     prelude::*,
-    thread::kernel_thread::KernelThreadExt,
 };
 
 fn start_block_device(device_name: &str) -> Result<Arc<dyn BlockDevice>> {
@@ -39,7 +39,7 @@ fn start_block_device(device_name: &str) -> Result<Arc<dyn BlockDevice>> {
                 virtio_block_device.handle_requests();
             }
         };
-        crate::Thread::spawn_kernel_thread(crate::ThreadOptions::new(task_fn));
+        crate::ThreadOptions::new(task_fn).spawn();
         Ok(device)
     } else {
         return_errno_with_message!(Errno::ENOENT, "Device does not exist")

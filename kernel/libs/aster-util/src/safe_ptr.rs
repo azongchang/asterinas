@@ -54,7 +54,7 @@ use ostd::{
 ///
 /// The generic parameter `M` of `SafePtr<_, M, _>` must implement the `VmIo`
 /// trait. The most important `VmIo` types are `Vmar`, `Vmo`, `IoMem`, and
-/// `Frame`. The blanket implementations of `VmIo` also include pointer-like
+/// `UFrame`. The blanket implementations of `VmIo` also include pointer-like
 /// types that refer to a `VmIo` type. Some examples are `&Vmo`, `Box<Vmar>`,
 /// and `Arc<IoMem>`.
 ///
@@ -368,7 +368,7 @@ impl<T, R> SafePtr<T, DmaStream, R> {
 }
 
 #[inherit_methods(from = "(*self)")]
-impl<'a, T, R> SafePtr<T, &'a DmaStream, R> {
+impl<T, R> SafePtr<T, &DmaStream, R> {
     pub fn sync(&self) -> Result<()>;
 }
 

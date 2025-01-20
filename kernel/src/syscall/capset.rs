@@ -18,19 +18,29 @@ pub fn sys_capset(
     cap_user_data_addr: Vaddr,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     let cap_user_header: cap_user_header_t =
         user_space.read_val::<cap_user_header_t>(cap_user_header_addr)?;
 
     if cap_user_header.version != LINUX_CAPABILITY_VERSION_3 {
         return_errno_with_message!(Errno::EINVAL, "not supported (capability version is not 3)");
-    };
+    }
 
     // The ability to set capabilities of any other process has been deprecated.
     // See: https://elixir.bootlin.com/linux/v6.9.3/source/kernel/capability.c#L209 for more details.
     let header_pid = cap_user_header.pid;
     if header_pid != 0 && header_pid != ctx.process.pid() {
         return_errno_with_message!(Errno::EINVAL, "invalid pid");
+    }
+
+    // Check if the current process has CAP_SET_CAP capability
+    if !(ctx
+        .posix_thread
+        .credentials()
+        .permitted_capset()
+        .contains(CapSet::SETPCAP))
+    {
+        return_errno_with_message!(Errno::EPERM, "permission denied");
     }
 
     // Convert the cap(u32) to u64

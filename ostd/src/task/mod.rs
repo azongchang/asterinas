@@ -7,30 +7,43 @@ mod kernel_stack;
 mod preempt;
 mod processor;
 pub mod scheduler;
+mod utils;
 
-use core::{any::Any, cell::UnsafeCell};
+use core::{
+    any::Any,
+    borrow::Borrow,
+    cell::{Cell, SyncUnsafeCell},
+    ops::Deref,
+    ptr::NonNull,
+};
 
 use kernel_stack::KernelStack;
 pub(crate) use preempt::cpu_local::reset_preempt_info;
 use processor::current_task;
+use utils::ForceSync;
 
 pub use self::{
     preempt::{disable_preempt, DisabledPreemptGuard},
     scheduler::info::{AtomicCpuId, TaskScheduleInfo},
 };
 pub(crate) use crate::arch::task::{context_switch, TaskContext};
-use crate::{prelude::*, user::UserSpace};
+use crate::{prelude::*, trap::in_interrupt_context, user::UserSpace};
 
 /// A task that executes a function to the end.
 ///
 /// Each task is associated with per-task data and an optional user space.
 /// If having a user space, the task can switch to the user space to
 /// execute user code. Multiple tasks can share a single user space.
+#[derive(Debug)]
 pub struct Task {
-    func: Box<dyn Fn() + Send + Sync>,
+    #[allow(clippy::type_complexity)]
+    func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
+
     data: Box<dyn Any + Send + Sync>,
+    local_data: ForceSync<Box<dyn Any + Send>>,
+
     user_space: Option<Arc<UserSpace>>,
-    ctx: UnsafeCell<TaskContext>,
+    ctx: SyncUnsafeCell<TaskContext>,
     /// kernel stack, note that the top is SyscallFrame/TrapFrame
     #[allow(dead_code)]
     kstack: KernelStack,
@@ -38,19 +51,18 @@ pub struct Task {
     schedule_info: TaskScheduleInfo,
 }
 
-// SAFETY: `UnsafeCell<TaskContext>` is not `Sync`. However, we only use it in `schedule()` where
-// we have exclusive access to the field.
-unsafe impl Sync for Task {}
-
 impl Task {
     /// Gets the current task.
     ///
     /// It returns `None` if the function is called in the bootstrap context.
-    pub fn current() -> Option<Arc<Task>> {
-        current_task()
+    pub fn current() -> Option<CurrentTask> {
+        let current_task = current_task()?;
+
+        // SAFETY: `current_task` is the current task.
+        Some(unsafe { CurrentTask::new(current_task) })
     }
 
-    pub(super) fn ctx(&self) -> &UnsafeCell<TaskContext> {
+    pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
         &self.ctx
     }
 
@@ -74,13 +86,15 @@ impl Task {
     ///
     /// Note that this method cannot be simply named "yield" as the name is
     /// a Rust keyword.
+    #[track_caller]
     pub fn yield_now() {
         scheduler::yield_now()
     }
 
-    /// Runs the task.
+    /// Kicks the task scheduler to run the task.
     ///
     /// BUG: This method highly depends on the current scheduling policy.
+    #[track_caller]
     pub fn run(self: &Arc<Self>) {
         scheduler::run_new_task(self.clone());
     }
@@ -104,25 +118,30 @@ impl Task {
         }
     }
 
-    /// Exits the current task.
-    ///
-    /// The task `self` must be the task that is currently running.
-    ///
-    /// **NOTE:** If there is anything left on the stack, it will be forgotten. This behavior may
-    /// lead to resource leakage.
-    fn exit(self: Arc<Self>) -> ! {
-        // `current_task()` still holds a strong reference, so nothing is destroyed at this point,
-        // neither is the kernel stack.
-        drop(self);
-        scheduler::exit_current();
-        unreachable!()
+    /// Saves the FPU state for user task.
+    pub fn save_fpu_state(&self) {
+        let Some(user_space) = self.user_space.as_ref() else {
+            return;
+        };
+
+        user_space.fpu_state().save();
+    }
+
+    /// Restores the FPU state for user task.
+    pub fn restore_fpu_state(&self) {
+        let Some(user_space) = self.user_space.as_ref() else {
+            return;
+        };
+
+        user_space.fpu_state().restore();
     }
 }
 
 /// Options to create or spawn a new task.
 pub struct TaskOptions {
-    func: Option<Box<dyn Fn() + Send + Sync>>,
+    func: Option<Box<dyn FnOnce() + Send>>,
     data: Option<Box<dyn Any + Send + Sync>>,
+    local_data: Option<Box<dyn Any + Send>>,
     user_space: Option<Arc<UserSpace>>,
 }
 
@@ -130,11 +149,12 @@ impl TaskOptions {
     /// Creates a set of options for a task.
     pub fn new<F>(func: F) -> Self
     where
-        F: Fn() + Send + Sync + 'static,
+        F: FnOnce() + Send + Sync + 'static,
     {
         Self {
             func: Some(Box::new(func)),
             data: None,
+            local_data: None,
             user_space: None,
         }
     }
@@ -142,7 +162,7 @@ impl TaskOptions {
     /// Sets the function that represents the entry point of the task.
     pub fn func<F>(mut self, func: F) -> Self
     where
-        F: Fn() + Send + Sync + 'static,
+        F: Fn() + Send + 'static,
     {
         self.func = Some(Box::new(func));
         self
@@ -157,6 +177,15 @@ impl TaskOptions {
         self
     }
 
+    /// Sets the local data associated with the task.
+    pub fn local_data<T>(mut self, data: T) -> Self
+    where
+        T: Any + Send,
+    {
+        self.local_data = Some(Box::new(data));
+        self
+    }
+
     /// Sets the user space associated with the task.
     pub fn user_space(mut self, user_space: Option<Arc<UserSpace>>) -> Self {
         self.user_space = user_space;
@@ -167,16 +196,35 @@ impl TaskOptions {
     pub fn build(self) -> Result<Task> {
         /// all task will entering this function
         /// this function is mean to executing the task_fn in Task
-        extern "C" fn kernel_task_entry() {
-            let current_task = current_task()
+        extern "C" fn kernel_task_entry() -> ! {
+            // See `switch_to_task` for why we need this.
+            crate::arch::irq::enable_local();
+
+            let current_task = Task::current()
                 .expect("no current task, it should have current task in kernel task entry");
-            current_task.func.call(());
-            current_task.exit();
+
+            current_task.restore_fpu_state();
+
+            // SAFETY: The `func` field will only be accessed by the current task in the task
+            // context, so the data won't be accessed concurrently.
+            let task_func = unsafe { current_task.func.get() };
+            let task_func = task_func
+                .take()
+                .expect("task function is `None` when trying to run");
+            task_func();
+
+            // Manually drop all the on-stack variables to prevent memory leakage!
+            // This is needed because `scheduler::exit_current()` will never return.
+            //
+            // However, `current_task` _borrows_ the current task without holding
+            // an extra reference count. So we do nothing here.
+
+            scheduler::exit_current();
         }
 
         let kstack = KernelStack::new_with_guard_page()?;
 
-        let mut ctx = UnsafeCell::new(TaskContext::default());
+        let mut ctx = SyncUnsafeCell::new(TaskContext::default());
         if let Some(user_space) = self.user_space.as_ref() {
             ctx.get_mut().set_tls_pointer(user_space.tls_pointer());
         };
@@ -190,12 +238,12 @@ impl TaskOptions {
         // to at least 16 bytes. And a larger alignment is needed if larger arguments
         // are passed to the function. The `kernel_task_entry` function does not
         // have any arguments, so we only need to align the stack pointer to 16 bytes.
-        ctx.get_mut()
-            .set_stack_pointer(crate::mm::paddr_to_vaddr(kstack.end_paddr() - 16));
+        ctx.get_mut().set_stack_pointer(kstack.end_vaddr() - 16);
 
         let new_task = Task {
-            func: self.func.unwrap(),
-            data: self.data.unwrap(),
+            func: ForceSync::new(Cell::new(self.func)),
+            data: self.data.unwrap_or_else(|| Box::new(())),
+            local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             user_space: self.user_space,
             ctx,
             kstack,
@@ -207,11 +255,86 @@ impl TaskOptions {
         Ok(new_task)
     }
 
-    /// Builds a new task and run it immediately.
+    /// Builds a new task and runs it immediately.
+    #[track_caller]
     pub fn spawn(self) -> Result<Arc<Task>> {
         let task = Arc::new(self.build()?);
         task.run();
         Ok(task)
+    }
+}
+
+/// The current task.
+///
+/// This type is not `Send`, so it cannot outlive the current task.
+///
+/// This type is also not `Sync`, so it can provide access to the local data of the current task.
+#[derive(Debug)]
+pub struct CurrentTask(NonNull<Task>);
+
+// The intern `NonNull<Task>` contained by `CurrentTask` implies that `CurrentTask` is `!Send` and
+// `!Sync`. But it is still good to do this explicitly because these properties are key for
+// soundness.
+impl !Send for CurrentTask {}
+impl !Sync for CurrentTask {}
+
+impl CurrentTask {
+    /// # Safety
+    ///
+    /// The caller must ensure that `task` is the current task.
+    unsafe fn new(task: NonNull<Task>) -> Self {
+        Self(task)
+    }
+
+    /// Returns the local data of the current task.
+    ///
+    /// Note that the local data is only accessible in the task context. Although there is a
+    /// current task in the non-task context (e.g. IRQ handlers), access to the local data is
+    /// forbidden as it may cause soundness problems.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if called in a non-task context.
+    pub fn local_data(&self) -> &(dyn Any + Send) {
+        assert!(!in_interrupt_context());
+
+        let local_data = &self.local_data;
+
+        // SAFETY: The `local_data` field will only be accessed by the current task in the task
+        // context, so the data won't be accessed concurrently.
+        &**unsafe { local_data.get() }
+    }
+
+    /// Returns a cloned `Arc<Task>`.
+    pub fn cloned(&self) -> Arc<Task> {
+        let ptr = self.0.as_ptr();
+
+        // SAFETY: The current task is always a valid task and it is always contained in an `Arc`.
+        unsafe { Arc::increment_strong_count(ptr) };
+
+        // SAFETY: We've increased the reference count in the current `Arc<Task>` above.
+        unsafe { Arc::from_raw(ptr) }
+    }
+}
+
+impl Deref for CurrentTask {
+    type Target = Task;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: The current task is always a valid task.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl AsRef<Task> for CurrentTask {
+    fn as_ref(&self) -> &Task {
+        self
+    }
+}
+
+impl Borrow<Task> for CurrentTask {
+    fn borrow(&self) -> &Task {
+        self
     }
 }
 

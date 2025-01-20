@@ -3,8 +3,8 @@
 use core::{fmt::Debug, marker::PhantomData, ops::Range};
 
 use super::{
-    nr_subpage_per_huge, page::meta::MapTrackingStatus, page_prop::PageProperty, page_size, Paddr,
-    PagingConstsTrait, PagingLevel, Vaddr,
+    nr_subpage_per_huge, page_prop::PageProperty, page_size, Paddr, PagingConstsTrait, PagingLevel,
+    PodOnce, Vaddr,
 };
 use crate::{
     arch::mm::{PageTableEntry, PagingConsts},
@@ -90,6 +90,26 @@ impl PageTable<UserMode> {
         // mappings are shared.
         unsafe {
             self.root.activate();
+        }
+    }
+
+    /// Clear the page table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    ///  1. No other cursors are accessing the page table.
+    ///  2. No other CPUs activates the page table.
+    pub(in crate::mm) unsafe fn clear(&self) {
+        let mut root_node = self.root.clone_shallow().lock();
+        const NR_PTES_PER_NODE: usize = nr_subpage_per_huge::<PagingConsts>();
+        for i in 0..NR_PTES_PER_NODE / 2 {
+            let root_entry = root_node.entry(i);
+            if !root_entry.is_none() {
+                let old = root_entry.replace(Child::None);
+                // Since no others are accessing the old child, dropping it is fine.
+                drop(old);
+            }
         }
     }
 }
@@ -318,7 +338,9 @@ pub(super) unsafe fn page_walk<E: PageTableEntryTrait, C: PagingConstsTrait>(
 /// The interface for defining architecture-specific page table entries.
 ///
 /// Note that a default PTE should be a PTE that points to nothing.
-pub trait PageTableEntryTrait: Clone + Copy + Debug + Default + Pod + Sized + Sync {
+pub trait PageTableEntryTrait:
+    Clone + Copy + Debug + Default + Pod + PodOnce + Sized + Send + Sync + 'static
+{
     /// Create a set of new invalid page table flags that indicates an absent page.
     ///
     /// Note that currently the implementation requires an all zero PTE to be an absent PTE.
@@ -327,6 +349,10 @@ pub trait PageTableEntryTrait: Clone + Copy + Debug + Default + Pod + Sized + Sy
     }
 
     /// If the flags are present with valid mappings.
+    ///
+    /// For PTEs created by [`Self::new_absent`], this method should return
+    /// false. And for PTEs created by [`Self::new_page`] or [`Self::new_pt`]
+    /// and modified with [`Self::set_prop`] this method should return true.
     fn is_present(&self) -> bool;
 
     /// Create a new PTE with the given physical address and flags that map to a page.
@@ -343,6 +369,10 @@ pub trait PageTableEntryTrait: Clone + Copy + Debug + Default + Pod + Sized + Sy
 
     fn prop(&self) -> PageProperty;
 
+    /// Set the page property of the PTE.
+    ///
+    /// This will be only done if the PTE is present. If not, this method will
+    /// do nothing.
     fn set_prop(&mut self, prop: PageProperty);
 
     /// If the PTE maps a page rather than a child page table.

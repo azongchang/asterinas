@@ -1,114 +1,113 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use aster_bigtcp::wire::IpEndpoint;
+use aster_bigtcp::{
+    errors::tcp::ConnectError,
+    socket::{ConnectState, RawTcpOption, RawTcpSetOption},
+    wire::IpEndpoint,
+};
 
-use super::{connected::ConnectedStream, init::InitStream};
-use crate::{net::iface::BoundTcpSocket, prelude::*, process::signal::Pollee};
+use super::{connected::ConnectedStream, init::InitStream, StreamObserver};
+use crate::{
+    events::IoEvents,
+    net::iface::{BoundPort, Iface, TcpConnection},
+    prelude::*,
+};
 
 pub struct ConnectingStream {
-    bound_socket: BoundTcpSocket,
+    tcp_conn: TcpConnection,
     remote_endpoint: IpEndpoint,
-    conn_result: RwLock<Option<ConnResult>>,
 }
 
-#[derive(Clone, Copy)]
-enum ConnResult {
-    Connected,
-    Refused,
-}
-
-pub enum NonConnectedStream {
-    Init(InitStream),
+pub enum ConnResult {
     Connecting(ConnectingStream),
+    Connected(ConnectedStream),
+    Refused(InitStream),
 }
 
 impl ConnectingStream {
     pub fn new(
-        bound_socket: BoundTcpSocket,
+        bound_port: BoundPort,
         remote_endpoint: IpEndpoint,
-    ) -> core::result::Result<Self, (Error, BoundTcpSocket)> {
-        // The only reason this method might fail is because we're trying to connect to an
-        // unspecified address (i.e. 0.0.0.0). We currently have no support for binding to,
-        // listening on, or connecting to the unspecified address.
-        //
-        // We assume the remote will just refuse to connect, so we return `ECONNREFUSED`.
-        if bound_socket.connect(remote_endpoint).is_err() {
-            return Err((
-                Error::with_message(
-                    Errno::ECONNREFUSED,
-                    "connecting to an unspecified address is not supported",
-                ),
-                bound_socket,
-            ));
-        }
+        option: &RawTcpOption,
+        observer: StreamObserver,
+    ) -> core::result::Result<Self, (Error, BoundPort)> {
+        let tcp_conn =
+            match TcpConnection::new_connect(bound_port, remote_endpoint, option, observer) {
+                Ok(tcp_conn) => tcp_conn,
+                Err((bound_port, ConnectError::AddressInUse)) => {
+                    return Err((
+                        Error::with_message(Errno::EADDRNOTAVAIL, "connection key conflicts"),
+                        bound_port,
+                    ))
+                }
+                Err((bound_port, _)) => {
+                    // The only reason this method might go to this branch is because
+                    // we're trying to connect to an unspecified address (i.e. 0.0.0.0).
+                    // We currently have no support for binding to,
+                    // listening on, or connecting to the unspecified address.
+                    //
+                    // We assume the remote will just refuse to connect,
+                    // so we return `ECONNREFUSED`.
+                    return Err((
+                        Error::with_message(
+                            Errno::ECONNREFUSED,
+                            "connecting to an unspecified address is not supported",
+                        ),
+                        bound_port,
+                    ));
+                }
+            };
 
         Ok(Self {
-            bound_socket,
+            tcp_conn,
             remote_endpoint,
-            conn_result: RwLock::new(None),
         })
     }
 
-    pub fn into_result(self) -> core::result::Result<ConnectedStream, (Error, NonConnectedStream)> {
-        let conn_result = *self.conn_result.read();
-        match conn_result {
-            Some(ConnResult::Connected) => Ok(ConnectedStream::new(
-                self.bound_socket,
+    pub fn has_result(&self) -> bool {
+        match self.tcp_conn.connect_state() {
+            ConnectState::Connecting => false,
+            ConnectState::Connected => true,
+            ConnectState::Refused => true,
+        }
+    }
+
+    pub fn into_result(self) -> ConnResult {
+        let next_state = self.tcp_conn.connect_state();
+
+        match next_state {
+            ConnectState::Connecting => ConnResult::Connecting(self),
+            ConnectState::Connected => ConnResult::Connected(ConnectedStream::new(
+                self.tcp_conn,
                 self.remote_endpoint,
                 true,
             )),
-            Some(ConnResult::Refused) => Err((
-                Error::with_message(Errno::ECONNREFUSED, "the connection is refused"),
-                NonConnectedStream::Init(InitStream::new_bound(self.bound_socket)),
-            )),
-            None => Err((
-                Error::with_message(Errno::EAGAIN, "the connection is pending"),
-                NonConnectedStream::Connecting(self),
+            ConnectState::Refused => ConnResult::Refused(InitStream::new_bound(
+                self.tcp_conn.into_bound_port().unwrap(),
             )),
         }
     }
 
     pub fn local_endpoint(&self) -> IpEndpoint {
-        self.bound_socket.local_endpoint().unwrap()
+        self.tcp_conn.local_endpoint().unwrap()
     }
 
     pub fn remote_endpoint(&self) -> IpEndpoint {
         self.remote_endpoint
     }
 
-    pub(super) fn init_pollee(&self, pollee: &Pollee) {
-        pollee.reset_events();
+    pub fn iface(&self) -> &Arc<Iface> {
+        self.tcp_conn.iface()
     }
 
-    /// Returns `true` when `conn_result` becomes ready, which indicates that the caller should
-    /// invoke the `into_result()` method as soon as possible.
-    ///
-    /// Since `into_result()` needs to be called only once, this method will return `true`
-    /// _exactly_ once. The caller is responsible for not missing this event.
-    #[must_use]
-    pub(super) fn update_io_events(&self) -> bool {
-        if self.conn_result.read().is_some() {
-            return false;
-        }
+    pub(super) fn check_io_events(&self) -> IoEvents {
+        IoEvents::empty()
+    }
 
-        self.bound_socket.raw_with(|socket| {
-            let mut result = self.conn_result.write();
-            if result.is_some() {
-                return false;
-            }
-
-            // Connected
-            if socket.can_send() {
-                *result = Some(ConnResult::Connected);
-                return true;
-            }
-            // Connecting
-            if socket.is_open() {
-                return false;
-            }
-            // Refused
-            *result = Some(ConnResult::Refused);
-            true
-        })
+    pub(super) fn set_raw_option<R>(
+        &self,
+        set_option: impl FnOnce(&dyn RawTcpSetOption) -> R,
+    ) -> R {
+        set_option(&self.tcp_conn)
     }
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ostd::sync::WaitQueue;
 
@@ -10,18 +10,19 @@ use super::{
     UnixStreamSocket,
 };
 use crate::{
-    events::{IoEvents, Observer},
+    events::IoEvents,
     fs::file_handle::FileLike,
     net::socket::{
         unix::addr::{UnixSocketAddrBound, UnixSocketAddrKey},
         SockShutdownCmd, SocketAddr,
     },
     prelude::*,
-    process::signal::{Pollee, Poller},
+    process::signal::{PollHandle, Pollee},
 };
 
 pub(super) struct Listener {
     backlog: Arc<Backlog>,
+    is_write_shutdown: AtomicBool,
     writer_pollee: Pollee,
 }
 
@@ -31,17 +32,17 @@ impl Listener {
         reader_pollee: Pollee,
         writer_pollee: Pollee,
         backlog: usize,
-        is_shutdown: bool,
+        is_read_shutdown: bool,
+        is_write_shutdown: bool,
     ) -> Self {
-        // Note that the I/O events can be correctly inherited from `Init`. There is no need to
-        // explicitly call `Pollee::reset_io_events`.
         let backlog = BACKLOG_TABLE
-            .add_backlog(addr, reader_pollee, backlog, is_shutdown)
+            .add_backlog(addr, reader_pollee, backlog, is_read_shutdown)
             .unwrap();
-        writer_pollee.del_events(IoEvents::OUT);
+        writer_pollee.invalidate();
 
         Self {
             backlog,
+            is_write_shutdown: AtomicBool::new(is_write_shutdown),
             writer_pollee,
         }
     }
@@ -65,7 +66,8 @@ impl Listener {
     pub(super) fn shutdown(&self, cmd: SockShutdownCmd) {
         match cmd {
             SockShutdownCmd::SHUT_WR | SockShutdownCmd::SHUT_RDWR => {
-                self.writer_pollee.add_events(IoEvents::ERR);
+                self.is_write_shutdown.store(true, Ordering::Relaxed);
+                self.writer_pollee.notify(IoEvents::ERR);
             }
             SockShutdownCmd::SHUT_RD => (),
         }
@@ -78,30 +80,18 @@ impl Listener {
         }
     }
 
-    pub(super) fn poll(&self, mask: IoEvents, mut poller: Option<&mut Poller>) -> IoEvents {
+    pub(super) fn poll(&self, mask: IoEvents, mut poller: Option<&mut PollHandle>) -> IoEvents {
         let reader_events = self.backlog.poll(mask, poller.as_deref_mut());
-        let writer_events = self.writer_pollee.poll(mask, poller);
+
+        let writer_events = self.writer_pollee.poll_with(mask, poller, || {
+            if self.is_write_shutdown.load(Ordering::Relaxed) {
+                IoEvents::ERR
+            } else {
+                IoEvents::empty()
+            }
+        });
 
         combine_io_events(mask, reader_events, writer_events)
-    }
-
-    pub(super) fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        self.backlog.register_observer(observer.clone(), mask)?;
-        self.writer_pollee.register_observer(observer, mask);
-        Ok(())
-    }
-
-    pub(super) fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        let reader_observer = self.backlog.unregister_observer(observer);
-        let writer_observer = self.writer_pollee.unregister_observer(observer);
-        reader_observer.or(writer_observer)
     }
 }
 
@@ -141,6 +131,8 @@ impl BacklogTable {
             return None;
         }
 
+        // Note that the cached events can be correctly inherited from `Init`, so there is no need
+        // to explicitly call `Pollee::invalidate`.
         let new_backlog = Arc::new(Backlog::new(addr, pollee, backlog, is_shutdown));
         backlog_sockets.insert(addr_key, new_backlog.clone());
 
@@ -191,11 +183,7 @@ impl Backlog {
         let Some(incoming_conns) = &mut *locked_incoming_conns else {
             return_errno_with_message!(Errno::EINVAL, "the socket is shut down for reading");
         };
-
         let conn = incoming_conns.pop_front();
-        if incoming_conns.is_empty() {
-            self.pollee.del_events(IoEvents::IN);
-        }
 
         drop(locked_incoming_conns);
 
@@ -218,32 +206,30 @@ impl Backlog {
         let mut incoming_conns = self.incoming_conns.lock();
 
         *incoming_conns = None;
-        self.pollee.add_events(IoEvents::HUP);
-        self.pollee.del_events(IoEvents::IN);
+        self.pollee.notify(IoEvents::HUP);
 
         drop(incoming_conns);
 
         self.wait_queue.wake_all();
     }
 
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
-        self.pollee.poll(mask, poller)
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.pollee
+            .poll_with(mask, poller, || self.check_io_events())
     }
 
-    fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        self.pollee.register_observer(observer, mask);
-        Ok(())
-    }
+    fn check_io_events(&self) -> IoEvents {
+        let incoming_conns = self.incoming_conns.lock();
 
-    fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        self.pollee.unregister_observer(observer)
+        if let Some(conns) = &*incoming_conns {
+            if !conns.is_empty() {
+                IoEvents::IN
+            } else {
+                IoEvents::empty()
+            }
+        } else {
+            IoEvents::HUP
+        }
     }
 }
 
@@ -275,9 +261,9 @@ impl Backlog {
         }
 
         let (client_conn, server_conn) = init.into_connected(self.addr.clone());
-        incoming_conns.push_back(server_conn);
 
-        self.pollee.add_events(IoEvents::IN);
+        incoming_conns.push_back(server_conn);
+        self.pollee.notify(IoEvents::IN);
 
         Ok(client_conn)
     }

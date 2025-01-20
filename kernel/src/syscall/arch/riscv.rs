@@ -33,7 +33,7 @@ use crate::syscall::{
     getgid::sys_getgid,
     getgroups::sys_getgroups,
     getpeername::sys_getpeername,
-    getpgrp::sys_getpgrp,
+    getpgid::sys_getpgid,
     getpid::sys_getpid,
     getppid::sys_getppid,
     getrandom::sys_getrandom,
@@ -66,7 +66,7 @@ use crate::syscall::{
     prctl::sys_prctl,
     pread64::sys_pread64,
     preadv::{sys_preadv, sys_preadv2, sys_readv},
-    prlimit64::sys_prlimit64,
+    prlimit64::{sys_getrlimit, sys_prlimit64, sys_setrlimit},
     pselect6::sys_pselect6,
     pwrite64::sys_pwrite64,
     pwritev::{sys_pwritev, sys_pwritev2, sys_writev},
@@ -79,7 +79,7 @@ use crate::syscall::{
     rt_sigpending::sys_rt_sigpending,
     rt_sigprocmask::sys_rt_sigprocmask,
     rt_sigsuspend::sys_rt_sigsuspend,
-    sched_getaffinity::sys_sched_getaffinity,
+    sched_affinity::{sys_sched_getaffinity, sys_sched_setaffinity},
     sched_yield::sys_sched_yield,
     semctl::sys_semctl,
     semget::sys_semget,
@@ -191,6 +191,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_SETITIMER = 103          => sys_setitimer(args[..3]);
     SYS_TIMER_CREATE = 107       => sys_timer_create(args[..3]);
     SYS_TIMER_DELETE = 111       => sys_timer_delete(args[..1]);
+    SYS_SCHED_SETAFFINITY = 122  => sys_sched_setaffinity(args[..3]);
     SYS_SCHED_GETAFFINITY = 123  => sys_sched_getaffinity(args[..3]);
     SYS_SCHED_YIELD = 124        => sys_sched_yield(args[..0]);
     SYS_KILL = 129               => sys_kill(args[..2]);
@@ -213,12 +214,14 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_SETFSUID = 151           => sys_setfsuid(args[..1]);
     SYS_SETFSGID = 152           => sys_setfsgid(args[..1]);
     SYS_SETPGID = 154            => sys_setpgid(args[..2]);
-    SYS_GETPGRP = 155            => sys_getpgrp(args[..0]);
+    SYS_GETPGID = 155            => sys_getpgid(args[..1]);
     SYS_GETSID = 156             => sys_getsid(args[..1]);
     SYS_SETSID = 157             => sys_setsid(args[..0]);
     SYS_GETGROUPS = 158          => sys_getgroups(args[..2]);
     SYS_SETGROUPS = 159          => sys_setgroups(args[..2]);
     SYS_NEWUNAME = 160           => sys_uname(args[..1]);
+    SYS_GETRLIMIT = 163          => sys_getrlimit(args[..2]);
+    SYS_SETRLIMIT = 164          => sys_setrlimit(args[..2]);
     SYS_GETRUSAGE = 165          => sys_getrusage(args[..2]);
     SYS_UMASK = 166              => sys_umask(args[..1]);
     SYS_PRCTL = 167              => sys_prctl(args[..5]);
@@ -263,6 +266,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_EXECVEAT = 281           => sys_execveat(args[..5], &mut user_ctx);
     SYS_PREADV2 = 286            => sys_preadv2(args[..5]);
     SYS_PWRITEV2 = 287           => sys_pwritev2(args[..5]);
+    SYS_PRLIMIT64 = 302          => sys_prlimit64(args[..4]);
     SYS_CLOCK_GETTIME = 403      => sys_clock_gettime(args[..2]);
     SYS_CLOCK_NANOSLEEP = 407    => sys_clock_nanosleep(args[..4]);
     SYS_TIMER_GETTIME = 408      => sys_timer_gettime(args[..2]);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::sync::Arc;
+use core::ptr::NonNull;
 
 use super::{context_switch, Task, TaskContext};
 use crate::cpu_local_cell;
@@ -16,21 +17,11 @@ cpu_local_cell! {
     static BOOTSTRAP_CONTEXT: TaskContext = TaskContext::new();
 }
 
-/// Retrieves a reference to the current task running on the processor.
+/// Returns a pointer to the current task running on the processor.
 ///
 /// It returns `None` if the function is called in the bootstrap context.
-pub(super) fn current_task() -> Option<Arc<Task>> {
-    let ptr = CURRENT_TASK_PTR.load();
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: The pointer is set by `switch_to_task` and is guaranteed to be
-    // built with `Arc::into_raw`.
-    let restored = unsafe { Arc::from_raw(ptr) };
-    // To let the `CURRENT_TASK_PTR` still own the task, we clone and forget it
-    // to increment the reference count.
-    let _ = core::mem::ManuallyDrop::new(restored.clone());
-    Some(restored)
+pub(super) fn current_task() -> Option<NonNull<Task>> {
+    NonNull::new(CURRENT_TASK_PTR.load().cast_mut())
 }
 
 /// Calls this function to switch to other task
@@ -42,25 +33,23 @@ pub(super) fn current_task() -> Option<Arc<Task>> {
 ///
 /// This function will panic if called while holding preemption locks or with
 /// local IRQ disabled.
+#[track_caller]
 pub(super) fn switch_to_task(next_task: Arc<Task>) {
     super::atomic_mode::might_sleep();
 
     let irq_guard = crate::trap::disable_local();
 
     let current_task_ptr = CURRENT_TASK_PTR.load();
-    let current_task_ctx_ptr = if current_task_ptr.is_null() {
-        // SAFETY: Interrupts are disabled, so the pointer is safe to be fetched.
-        unsafe { BOOTSTRAP_CONTEXT.as_ptr_mut() }
-    } else {
-        // SAFETY: The pointer is not NULL and set as the current task.
-        let cur_task_arc = unsafe {
-            let restored = Arc::from_raw(current_task_ptr);
-            let _ = core::mem::ManuallyDrop::new(restored.clone());
-            restored
-        };
-        let ctx_ptr = cur_task_arc.ctx().get();
+    let current_task_ctx_ptr = if !current_task_ptr.is_null() {
+        // SAFETY: The current task is always alive.
+        let current_task = unsafe { &*current_task_ptr };
+        current_task.save_fpu_state();
 
-        ctx_ptr
+        // Throughout this method, the task's context is alive and can be exclusively used.
+        current_task.ctx.get()
+    } else {
+        // Throughout this method, interrupts are disabled and the context can be exclusively used.
+        BOOTSTRAP_CONTEXT.as_mut_ptr()
     };
 
     let next_task_ctx_ptr = next_task.ctx().get().cast_const();
@@ -83,7 +72,9 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
         drop(unsafe { Arc::from_raw(old_prev) });
     }
 
-    drop(irq_guard);
+    // Keep interrupts disabled during context switching. This will be enabled after switching to
+    // the target task (in the code below or in `kernel_task_entry`).
+    core::mem::forget(irq_guard);
 
     // SAFETY:
     // 1. `ctx` is only used in `reschedule()`. We have exclusive access to both the current task
@@ -99,4 +90,12 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     // always possible. For example, `context_switch` can switch directly to the entry point of the
     // next task. Not dropping is just fine because the only consequence is that we delay the drop
     // to the next task switching.
+
+    // See also `kernel_task_entry`.
+    crate::arch::irq::enable_local();
+
+    // The `next_task` was moved into `CURRENT_TASK_PTR` above, now restore its FPU state.
+    if let Some(current) = Task::current() {
+        current.restore_fpu_state();
+    }
 }

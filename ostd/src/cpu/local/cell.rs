@@ -39,6 +39,7 @@ use crate::arch;
 ///     println!("2nd FOO VAL: {:?}", FOO.load());
 /// }
 /// ```
+#[macro_export]
 macro_rules! cpu_local_cell {
     ($( $(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = $init:expr; )*) => {
         $(
@@ -55,8 +56,6 @@ macro_rules! cpu_local_cell {
     };
 }
 
-pub(crate) use cpu_local_cell;
-
 /// Inner mutable CPU-local objects.
 ///
 /// CPU-local cell objects are only accessible from the current CPU. When
@@ -71,12 +70,16 @@ pub(crate) use cpu_local_cell;
 /// You should only create the CPU-local cell object using the macro
 /// [`cpu_local_cell!`].
 ///
+/// Please exercise extreme caution when using `CpuLocalCell`. In most cases,
+/// it is necessary to disable interrupts or preemption when using it to prevent
+/// the operated object from being changed, which can lead to race conditions.
+///
 /// For the difference between [`super::CpuLocal`] and [`CpuLocalCell`], see
 /// [`super`].
 pub struct CpuLocalCell<T: 'static>(UnsafeCell<T>);
 
 impl<T: 'static> CpuLocalCell<T> {
-    /// Initialize a CPU-local object.
+    /// Initializes a CPU-local object.
     ///
     /// Please do not call this function directly. Instead, use the
     /// `cpu_local!` macro.
@@ -91,17 +94,22 @@ impl<T: 'static> CpuLocalCell<T> {
         Self(UnsafeCell::new(val))
     }
 
-    /// Get access to the underlying value through a raw pointer.
+    /// Gets access to the underlying value through a raw pointer.
     ///
     /// This function calculates the virtual address of the CPU-local object
     /// based on the CPU-local base address and the offset in the BSP.
     ///
-    /// # Safety
-    ///
-    /// The caller should ensure that within the entire execution of this
-    /// function, no interrupt or preemption can occur. Otherwise, the
-    /// returned pointer may points to the variable in another CPU.
-    pub unsafe fn as_ptr_mut(&'static self) -> *mut T {
+    /// This method is safe, but using the returned pointer will be unsafe.
+    /// Specifically,
+    /// - Preemption should be disabled from the time this method is called
+    ///   to the time the pointer is used. Otherwise, the pointer may point
+    ///   to the variable on another CPU, making it difficult or impossible
+    ///   to determine if the data can be borrowed.
+    /// - If the variable can be used in interrupt handlers, borrowing the
+    ///   data should be done with interrupts disabled. Otherwise, more care
+    ///   must be taken to ensure that the borrowing rules are correctly
+    ///   enforced, since the interrupts may come asynchronously.
+    pub fn as_mut_ptr(&'static self) -> *mut T {
         super::has_init::assert_true();
 
         let offset = {
@@ -208,6 +216,7 @@ impl<T: 'static + SingleInstructionBitXorAssign<T>> CpuLocalCell<T> {
     ///
     /// Note that this memory operation will not be elided or reordered by the
     /// compiler since it is a black-box.
+    #[allow(unused)]
     pub fn bitxor_assign(&'static self, rhs: T) {
         let offset = self as *const _ as usize - __cpu_local_start as usize;
         // SAFETY: The CPU-local object is defined in the `.cpu_local` section,

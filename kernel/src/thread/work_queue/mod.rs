@@ -2,9 +2,72 @@
 
 #![allow(dead_code)]
 
-use ostd::cpu::CpuSet;
+//! Work queue mechanism.
+//!
+//! # Overview
+//!
+//! A `workqueue` is a kernel-level mechanism used to schedule and execute deferred work.
+//! Deferred work refers to tasks that need to be executed at some point in the future,
+//! but not necessarily immediately.
+//!
+//! The workqueue mechanism is implemented using a combination of kernel threads and data
+//! structures such as `WorkItem`, `WorkQueue`, `Worker` and `WorkerPool`. The `WorkItem`
+//! represents a task to be processed, while the `WorkQueue` maintains the queue of submitted
+//! `WorkItems`. The `Worker` is responsible for processing these submitted tasks,
+//! and the `WorkerPool` manages and schedules these workers.
+//!
+//! # Examples
+//!
+//! The system has a default work queue and worker pool,
+//! and it also provides high-level APIs for users to use.
+//! Here is a basic example to how to use those APIs.
+//!
+//! ```rust
+//! use crate::thread::work_queue::{submit_work_func, submit_work_item, WorkItem};
+//!
+//! // Submit to high priority queue.
+//! submit_work_func(||{ }, true);
+//!
+//! // Submit to low priority queue.
+//! submit_work_func(||{ }, false);
+//!
+//! fn deferred_task(){
+//!     // ...
+//! }
+//!
+//! // Create a work item.
+//! let work_item = Arc::new(WorkItem::new(Box::new(deferred_task)));
+//!
+//! // Submit to high priority queue.
+//! submit_work_item(work_item, true);
+//!
+//! // Submit to low priority queue.
+//! submit_work_item(work_item, false);
+//! ```
+//!
+//! Certainly, users can also create a dedicated WorkQueue and WorkerPool.
+//!
+//! ```rust
+//! use ostd::cpu::CpuSet;
+//! use crate::thread::work_queue::{WorkQueue, WorkerPool, WorkItem};
+//!
+//! fn deferred_task(){
+//!     // ...
+//! }
+//!
+//! let cpu_set = CpuSet::new_full();
+//! let high_pri_pool = WorkerPool::new(true, cpu_set);
+//! let my_queue = WorkQueue::new(Arc::downgrade(high_pri_pool.get().unwrap()));
+//!
+//! let work_item = Arc::new(WorkItem::new(Box::new(deferred_task)));
+//! my_queue.enqueue(work_item);
+//!
+//! ```
+
+use intrusive_collections::linked_list::LinkedList;
+use ostd::cpu::{CpuId, CpuSet};
 use spin::Once;
-use work_item::WorkItem;
+use work_item::{WorkItem, WorkItemAdapter};
 use worker_pool::WorkerPool;
 
 use crate::prelude::*;
@@ -19,74 +82,12 @@ static WORKERPOOL_HIGH_PRI: Once<Arc<WorkerPool>> = Once::new();
 static WORKQUEUE_GLOBAL_NORMAL: Once<Arc<WorkQueue>> = Once::new();
 static WORKQUEUE_GLOBAL_HIGH_PRI: Once<Arc<WorkQueue>> = Once::new();
 
-/// Work queue mechanism.
-///
-/// # Overview
-///
-/// A `workqueue` is a kernel-level mechanism used to schedule and execute deferred work.
-/// Deferred work refers to tasks that need to be executed at some point in the future,
-/// but not necessarily immediately.
-///
-/// The workqueue mechanism is implemented using a combination of kernel threads and data
-/// structures such as `WorkItem`, `WorkQueue`, `Worker` and `WorkerPool`. The `WorkItem`
-/// represents a task to be processed, while the `WorkQueue` maintains the queue of submitted
-/// `WorkItems`. The `Worker` is responsible for processing these submitted tasks,
-/// and the `WorkerPool` manages and schedules these workers.
-///
-/// # Examples
-///
-/// The system has a default work queue and worker pool,
-/// and it also provides high-level APIs for users to use.
-/// Here is a basic example to how to use those APIs.
-///
-/// ```rust
-/// use crate::thread::work_queue::{submit_work_func, submit_work_item, WorkItem};
-///
-/// // Submit to high priority queue.
-/// submit_work_func(||{ }, true);
-///
-/// // Submit to low priority queue.
-/// submit_work_func(||{ }, false);
-///
-/// fn deferred_task(){
-///     // ...
-/// }
-///
-/// // Create a work item.
-/// let work_item = Arc::new(WorkItem::new(Box::new(deferred_task)));
-///
-/// // Submit to high priority queue.
-/// submit_work_item(work_item, true);
-///
-/// // Submit to low priority queue.
-/// submit_work_item(work_item, false);
-/// ```
-///
-/// Certainly, users can also create a dedicated WorkQueue and WorkerPool.
-///
-/// ```rust
-/// use ostd::cpu::CpuSet;
-/// use crate::thread::work_queue::{WorkQueue, WorkerPool, WorkItem};
-///
-/// fn deferred_task(){
-///     // ...
-/// }
-///
-/// let cpu_set = CpuSet::new_full();
-/// let high_pri_pool = WorkerPool::new(true, cpu_set);
-/// let my_queue = WorkQueue::new(Arc::downgrade(high_pri_pool.get().unwrap()));
-///
-/// let work_item = Arc::new(WorkItem::new(Box::new(deferred_task)));
-/// my_queue.enqueue(work_item);
-///
-/// ```
-
 /// Submit a function to a global work queue.
 pub fn submit_work_func<F>(work_func: F, work_priority: WorkPriority)
 where
     F: Fn() + Send + Sync + 'static,
 {
-    let work_item = Arc::new(WorkItem::new(Box::new(work_func)));
+    let work_item = WorkItem::new(Box::new(work_func));
     submit_work_item(work_item, work_priority);
 }
 
@@ -112,7 +113,7 @@ pub struct WorkQueue {
 }
 
 struct WorkQueueInner {
-    pending_work_items: Vec<Arc<WorkItem>>,
+    pending_work_items: LinkedList<WorkItemAdapter>,
 }
 
 impl WorkQueue {
@@ -122,7 +123,7 @@ impl WorkQueue {
         let queue = Arc::new(WorkQueue {
             worker_pool: worker_pool.clone(),
             inner: SpinLock::new(WorkQueueInner {
-                pending_work_items: Vec::new(),
+                pending_work_items: LinkedList::new(WorkItemAdapter::NEW),
             }),
         });
         worker_pool
@@ -141,26 +142,28 @@ impl WorkQueue {
             .disable_irq()
             .lock()
             .pending_work_items
-            .push(work_item);
-        if let Some(worker_pool) = self.worker_pool.upgrade() {
-            worker_pool.schedule()
-        }
+            .push_back(work_item);
+
         true
     }
 
     /// Request a pending work item. The `request_cpu` indicates the CPU where
     /// the calling worker is located.
-    fn dequeue(&self, request_cpu: u32) -> Option<Arc<WorkItem>> {
+    fn dequeue(&self, request_cpu: CpuId) -> Option<Arc<WorkItem>> {
         let mut inner = self.inner.disable_irq().lock();
-        let index = inner
-            .pending_work_items
-            .iter()
-            .position(|item| item.is_valid_cpu(request_cpu))?;
-        let item = inner.pending_work_items.remove(index);
-        Some(item)
+        let mut cursor = inner.pending_work_items.front_mut();
+        while let Some(item) = cursor.get() {
+            if item.is_valid_cpu(request_cpu) {
+                return cursor.remove();
+            }
+
+            cursor.move_next();
+        }
+
+        None
     }
 
-    fn has_pending_work_items(&self, request_cpu: u32) -> bool {
+    fn has_pending_work_items(&self, request_cpu: CpuId) -> bool {
         self.inner
             .disable_irq()
             .lock()

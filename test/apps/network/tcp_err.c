@@ -460,3 +460,91 @@ FN_TEST(sendmsg_and_recvmsg)
 	TEST_RES(sendmsg(sk_accepted, &msg, 0), _ret <= sndbuf);
 }
 END_TEST()
+
+FN_TEST(self_connect)
+{
+	int sk;
+	char buf[5];
+
+	sk = TEST_SUCC(socket(PF_INET, SOCK_STREAM, 0));
+
+	sk_addr.sin_port = htons(8888);
+	TEST_SUCC(bind(sk, (struct sockaddr *)&sk_addr, sizeof(sk_addr)));
+	TEST_SUCC(connect(sk, (struct sockaddr *)&sk_addr, sizeof(sk_addr)));
+
+	TEST_RES(write(sk, "hello", 5), _ret == 5);
+	TEST_RES(read(sk, buf, 5), _ret == 5 && memcmp(buf, "hello", 5) == 0);
+
+	TEST_SUCC(close(sk));
+}
+END_TEST()
+
+FN_TEST(listen_at_the_same_address)
+{
+	int sk_listen1;
+	int sk_listen2;
+
+	sk_listen1 = TEST_SUCC(socket(PF_INET, SOCK_STREAM, 0));
+	sk_listen2 = TEST_SUCC(socket(PF_INET, SOCK_STREAM, 0));
+
+	int reuse_option = 1;
+	TEST_SUCC(setsockopt(sk_listen1, SOL_SOCKET, SO_REUSEADDR,
+			     &reuse_option, sizeof(reuse_option)));
+	TEST_SUCC(setsockopt(sk_listen2, SOL_SOCKET, SO_REUSEADDR,
+			     &reuse_option, sizeof(reuse_option)));
+
+	sk_addr.sin_port = htons(8889);
+	TEST_SUCC(
+		bind(sk_listen1, (struct sockaddr *)&sk_addr, sizeof(sk_addr)));
+	TEST_SUCC(
+		bind(sk_listen2, (struct sockaddr *)&sk_addr, sizeof(sk_addr)));
+
+	TEST_SUCC(listen(sk_listen1, 3));
+	TEST_ERRNO(listen(sk_listen2, 3), EADDRINUSE);
+
+	TEST_SUCC(close(sk_listen1));
+	TEST_SUCC(close(sk_listen2));
+}
+END_TEST()
+
+FN_TEST(bind_and_connect_same_address)
+{
+	int sk_listen;
+	int sk_connect1;
+	int sk_connect2;
+
+	sk_listen = TEST_SUCC(socket(PF_INET, SOCK_STREAM, 0));
+	sk_connect1 = TEST_SUCC(socket(PF_INET, SOCK_STREAM, 0));
+	sk_connect2 = TEST_SUCC(socket(PF_INET, SOCK_STREAM, 0));
+
+	int reuse_option = 1;
+	TEST_SUCC(setsockopt(sk_connect1, SOL_SOCKET, SO_REUSEADDR,
+			     &reuse_option, sizeof(reuse_option)));
+	TEST_SUCC(setsockopt(sk_connect2, SOL_SOCKET, SO_REUSEADDR,
+			     &reuse_option, sizeof(reuse_option)));
+
+	int listen_port = 8890;
+	int connect_port = 8891;
+	sk_addr.sin_port = htons(listen_port);
+	TEST_SUCC(
+		bind(sk_listen, (struct sockaddr *)&sk_addr, sizeof(sk_addr)));
+	sk_addr.sin_port = htons(connect_port);
+	TEST_SUCC(bind(sk_connect1, (struct sockaddr *)&sk_addr,
+		       sizeof(sk_addr)));
+	TEST_SUCC(bind(sk_connect2, (struct sockaddr *)&sk_addr,
+		       sizeof(sk_addr)));
+
+	TEST_SUCC(listen(sk_listen, 3));
+
+	sk_addr.sin_port = htons(listen_port);
+	TEST_SUCC(connect(sk_connect1, (struct sockaddr *)&sk_addr,
+			  sizeof(sk_addr)));
+	TEST_ERRNO(connect(sk_connect2, (struct sockaddr *)&sk_addr,
+			   sizeof(sk_addr)),
+		   EADDRNOTAVAIL);
+
+	TEST_SUCC(close(sk_listen));
+	TEST_SUCC(close(sk_connect1));
+	TEST_SUCC(close(sk_connect2));
+}
+END_TEST()

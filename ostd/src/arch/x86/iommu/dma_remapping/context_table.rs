@@ -38,7 +38,7 @@ impl RootEntry {
 
 pub struct RootTable {
     /// Total 256 bus, each entry is 128 bits.
-    root_frame: Frame,
+    root_frame: Frame<()>,
     // TODO: Use radix tree instead.
     context_tables: BTreeMap<Paddr, ContextTable>,
 }
@@ -57,7 +57,7 @@ impl RootTable {
 
     pub(super) fn new() -> Self {
         Self {
-            root_frame: FrameAllocOptions::new(1).alloc_single().unwrap(),
+            root_frame: FrameAllocOptions::new().alloc_frame().unwrap(),
             context_tables: BTreeMap::new(),
         }
     }
@@ -98,7 +98,7 @@ impl RootTable {
         Ok(())
     }
 
-    /// Specify the device page table instead of creating a page table if not exists.
+    /// Specifies the device page table instead of creating a page table if not exists.
     ///
     /// This will be useful if we want all the devices to use the same page table.
     /// The original page table will be overwritten.
@@ -195,7 +195,7 @@ impl ContextEntry {
         }
     }
 
-    /// Get the second stage page translation pointer.
+    /// Gets the second stage page translation pointer.
     ///
     /// This function will not right shift the value after the `and` operation.
     pub const fn second_stage_pointer(&self) -> u64 {
@@ -236,14 +236,14 @@ pub enum AddressWidth {
 
 pub struct ContextTable {
     /// Total 32 devices, each device has 8 functions.
-    entries_frame: Frame,
+    entries_frame: Frame<()>,
     page_tables: BTreeMap<Paddr, PageTable<DeviceMode, PageTableEntry, PagingConsts>>,
 }
 
 impl ContextTable {
     fn new() -> Self {
         Self {
-            entries_frame: FrameAllocOptions::new(1).alloc_single().unwrap(),
+            entries_frame: FrameAllocOptions::new().alloc_frame().unwrap(),
             page_tables: BTreeMap::new(),
         }
     }

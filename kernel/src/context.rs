@@ -11,7 +11,10 @@ use ostd::{
 
 use crate::{
     prelude::*,
-    process::{posix_thread::PosixThread, Process},
+    process::{
+        posix_thread::{PosixThread, ThreadLocal},
+        Process,
+    },
     thread::Thread,
 };
 
@@ -19,6 +22,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Context<'a> {
     pub process: &'a Process,
+    pub thread_local: &'a ThreadLocal,
     pub posix_thread: &'a PosixThread,
     pub thread: &'a Thread,
     pub task: &'a Task,
@@ -26,7 +30,7 @@ pub struct Context<'a> {
 
 impl Context<'_> {
     /// Gets the userspace of the current task.
-    pub fn get_user_space(&self) -> CurrentUserSpace {
+    pub fn user_space(&self) -> CurrentUserSpace {
         CurrentUserSpace::new(self.task)
     }
 }
@@ -38,10 +42,10 @@ pub struct CurrentUserSpace<'a>(&'a VmSpace);
 
 /// Gets the [`CurrentUserSpace`] from the current task.
 ///
-/// This is slower than [`Context::get_user_space`]. Don't use this getter
+/// This is slower than [`Context::user_space`]. Don't use this getter
 /// If you get the access to the [`Context`].
 #[macro_export]
-macro_rules! get_current_userspace {
+macro_rules! current_userspace {
     () => {
         CurrentUserSpace::new(&ostd::task::Task::current().unwrap())
     };
@@ -53,9 +57,9 @@ impl<'a> CurrentUserSpace<'a> {
     /// This method is _not_ recommended for use, as it does not verify whether the provided
     /// `task` is the current task in release builds.
     ///
-    /// If you have access to a [`Context`], it is preferable to call [`Context::get_user_space`].
+    /// If you have access to a [`Context`], it is preferable to call [`Context::user_space`].
     ///
-    /// Otherwise, you can use the `get_current_userspace` macro
+    /// Otherwise, you can use the `current_userspace` macro
     /// to obtain an instance of `CurrentUserSpace` if it will only be used once.
     ///
     /// # Panics
@@ -159,15 +163,19 @@ impl<'a> CurrentUserSpace<'a> {
     }
 }
 
-/// A trait providing the ability to read a C string from the user space
-/// of the current process specifically for [`VmReader<'_, UserSpace>`], which
-/// should reading the bytes iteratively in the reader until encountering
-/// the end of the reader or reading a `\0` (is also included into the final C String).
+/// A trait providing the ability to read a C string from the user space.
+///
+/// The user space should be of the current process. The implemented method
+/// should read the bytes iteratively in the reader ([`VmReader`]) until
+/// encountering the end of the reader or reading a `\0` (which is also
+/// included in the final C String).
 pub trait ReadCString {
     fn read_cstring(&mut self) -> Result<CString>;
 }
 
-impl<'a> ReadCString for VmReader<'a, Fallible> {
+impl ReadCString for VmReader<'_, Fallible> {
+    /// Reads a C string from the user space.
+    ///
     /// This implementation is inspired by
     /// the `do_strncpy_from_user` function in Linux kernel.
     /// The original Linux implementation can be found at:

@@ -7,13 +7,13 @@ use super::{
     listener::Listener,
 };
 use crate::{
-    events::{IoEvents, Observer},
+    events::IoEvents,
     net::socket::{
         unix::addr::{UnixSocketAddr, UnixSocketAddrBound},
         SockShutdownCmd,
     },
     prelude::*,
-    process::signal::{Pollee, Poller},
+    process::signal::{PollHandle, Pollee},
 };
 
 pub(super) struct Init {
@@ -28,8 +28,8 @@ impl Init {
     pub(super) fn new() -> Self {
         Self {
             addr: None,
-            reader_pollee: Pollee::new(IoEvents::empty()),
-            writer_pollee: Pollee::new(IoEvents::OUT),
+            reader_pollee: Pollee::new(),
+            writer_pollee: Pollee::new(),
             is_read_shutdown: AtomicBool::new(false),
             is_write_shutdown: AtomicBool::new(false),
         }
@@ -87,6 +87,7 @@ impl Init {
             self.writer_pollee,
             backlog,
             self.is_read_shutdown.into_inner(),
+            self.is_write_shutdown.into_inner(),
         ))
     }
 
@@ -94,7 +95,7 @@ impl Init {
         match cmd {
             SockShutdownCmd::SHUT_WR | SockShutdownCmd::SHUT_RDWR => {
                 self.is_write_shutdown.store(true, Ordering::Relaxed);
-                self.writer_pollee.add_events(IoEvents::ERR);
+                self.writer_pollee.notify(IoEvents::ERR);
             }
             SockShutdownCmd::SHUT_RD => (),
         }
@@ -102,7 +103,7 @@ impl Init {
         match cmd {
             SockShutdownCmd::SHUT_RD | SockShutdownCmd::SHUT_RDWR => {
                 self.is_read_shutdown.store(true, Ordering::Relaxed);
-                self.reader_pollee.add_events(IoEvents::HUP);
+                self.reader_pollee.notify(IoEvents::HUP);
             }
             SockShutdownCmd::SHUT_WR => (),
         }
@@ -112,35 +113,28 @@ impl Init {
         self.addr.as_ref()
     }
 
-    pub(super) fn poll(&self, mask: IoEvents, mut poller: Option<&mut Poller>) -> IoEvents {
+    pub(super) fn poll(&self, mask: IoEvents, mut poller: Option<&mut PollHandle>) -> IoEvents {
         // To avoid loss of events, this must be compatible with
         // `Connected::poll`/`Listener::poll`.
-        let reader_events = self.reader_pollee.poll(mask, poller.as_deref_mut());
-        let writer_events = self.writer_pollee.poll(mask, poller);
+        let reader_events = self
+            .reader_pollee
+            .poll_with(mask, poller.as_deref_mut(), || {
+                if self.is_read_shutdown.load(Ordering::Relaxed) {
+                    IoEvents::HUP
+                } else {
+                    IoEvents::empty()
+                }
+            });
+        let writer_events = self.writer_pollee.poll_with(mask, poller, || {
+            if self.is_write_shutdown.load(Ordering::Relaxed) {
+                IoEvents::OUT | IoEvents::ERR
+            } else {
+                IoEvents::OUT
+            }
+        });
 
         // According to the Linux implementation, we always have `IoEvents::HUP` in this state.
         // Meanwhile, it is in `IoEvents::ALWAYS_POLL`, so we always return it.
         combine_io_events(mask, reader_events, writer_events) | IoEvents::HUP
-    }
-
-    pub(super) fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        // To avoid loss of events, this must be compatible with
-        // `Connected::poll`/`Listener::poll`.
-        self.reader_pollee.register_observer(observer.clone(), mask);
-        self.writer_pollee.register_observer(observer, mask);
-        Ok(())
-    }
-
-    pub(super) fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        let reader_observer = self.reader_pollee.unregister_observer(observer);
-        let writer_observer = self.writer_pollee.unregister_observer(observer);
-        reader_observer.or(writer_observer)
     }
 }

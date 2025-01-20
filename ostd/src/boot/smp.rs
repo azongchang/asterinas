@@ -10,11 +10,8 @@ use spin::Once;
 use crate::{
     arch::boot::smp::{bringup_all_aps, get_num_processors},
     cpu,
-    mm::{
-        paddr_to_vaddr,
-        page::{self, meta::KernelMeta, ContPages},
-        PAGE_SIZE,
-    },
+    mm::{frame::Segment, kspace::KernelMeta, paddr_to_vaddr, FrameAllocOptions, PAGE_SIZE},
+    task::Task,
 };
 
 pub(crate) static AP_BOOT_INFO: Once<ApBootInfo> = Once::new();
@@ -23,7 +20,7 @@ const AP_BOOT_STACK_SIZE: usize = PAGE_SIZE * 64;
 
 pub(crate) struct ApBootInfo {
     /// It holds the boot stack top pointers used by all APs.
-    pub(crate) boot_stack_array: ContPages<KernelMeta>,
+    pub(crate) boot_stack_array: Segment<KernelMeta>,
     /// `per_ap_info` maps each AP's ID to its associated boot information.
     per_ap_info: BTreeMap<u32, PerApInfo>,
 }
@@ -31,13 +28,14 @@ pub(crate) struct ApBootInfo {
 struct PerApInfo {
     is_started: AtomicBool,
     // TODO: When the AP starts up and begins executing tasks, the boot stack will
-    // no longer be used, and the `ContPages` can be deallocated (this problem also
+    // no longer be used, and the `Segment` can be deallocated (this problem also
     // exists in the boot processor, but the memory it occupies should be returned
     // to the frame allocator).
-    boot_stack_pages: ContPages<KernelMeta>,
+    #[allow(dead_code)]
+    boot_stack_pages: Segment<KernelMeta>,
 }
 
-static AP_LATE_ENTRY: Once<fn() -> !> = Once::new();
+static AP_LATE_ENTRY: Once<fn()> = Once::new();
 
 /// Boot all application processors.
 ///
@@ -61,14 +59,17 @@ pub fn boot_all_aps() {
     AP_BOOT_INFO.call_once(|| {
         let mut per_ap_info = BTreeMap::new();
         // Use two pages to place stack pointers of all APs, thus support up to 1024 APs.
-        let boot_stack_array =
-            page::allocator::alloc_contiguous(2 * PAGE_SIZE, |_| KernelMeta::default()).unwrap();
+        let boot_stack_array = FrameAllocOptions::new()
+            .zeroed(false)
+            .alloc_segment_with(2, |_| KernelMeta)
+            .unwrap();
         assert!(num_cpus < 1024);
 
         for ap in 1..num_cpus {
-            let boot_stack_pages =
-                page::allocator::alloc_contiguous(AP_BOOT_STACK_SIZE, |_| KernelMeta::default())
-                    .unwrap();
+            let boot_stack_pages = FrameAllocOptions::new()
+                .zeroed(false)
+                .alloc_segment_with(AP_BOOT_STACK_SIZE / PAGE_SIZE, |_| KernelMeta)
+                .unwrap();
             let boot_stack_ptr = paddr_to_vaddr(boot_stack_pages.end_paddr());
             let stack_array_ptr = paddr_to_vaddr(boot_stack_array.start_paddr()) as *mut u64;
             // SAFETY: The `stack_array_ptr` is valid and aligned.
@@ -104,7 +105,7 @@ pub fn boot_all_aps() {
 ///
 /// Once the entry function is registered, all the application processors
 /// will jump to the entry function immediately.
-pub fn register_ap_entry(entry: fn() -> !) {
+pub fn register_ap_entry(entry: fn()) {
     AP_LATE_ENTRY.call_once(|| entry);
 }
 
@@ -150,6 +151,9 @@ fn ap_early_entry(local_apic_id: u32) -> ! {
 
     let ap_late_entry = AP_LATE_ENTRY.wait();
     ap_late_entry();
+
+    Task::yield_now();
+    unreachable!("`yield_now` in the boot context should not return");
 }
 
 fn wait_for_all_aps_started() {

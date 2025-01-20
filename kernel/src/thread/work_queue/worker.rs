@@ -2,14 +2,16 @@
 
 #![allow(dead_code)]
 
-use ostd::{cpu::CpuSet, task::Task};
+use ostd::{
+    cpu::{CpuId, CpuSet},
+    task::Task,
+};
 
 use super::worker_pool::WorkerPool;
 use crate::{
     prelude::*,
-    sched::priority::{Priority, PriorityRange},
-    thread::kernel_thread::{create_new_kernel_task, ThreadOptions},
-    Thread,
+    sched::priority::Priority,
+    thread::{kernel_thread::ThreadOptions, AsThread},
 };
 
 /// A worker thread. A `Worker` will attempt to retrieve unfinished
@@ -19,7 +21,7 @@ use crate::{
 pub(super) struct Worker {
     worker_pool: Weak<WorkerPool>,
     bound_task: Arc<Task>,
-    bound_cpu: u32,
+    bound_cpu: CpuId,
     inner: SpinLock<WorkerInner>,
 }
 
@@ -39,7 +41,7 @@ enum WorkerStatus {
 
 impl Worker {
     /// Creates a new `Worker` to the given `worker_pool`.
-    pub(super) fn new(worker_pool: Weak<WorkerPool>, bound_cpu: u32) -> Arc<Self> {
+    pub(super) fn new(worker_pool: Weak<WorkerPool>, bound_cpu: CpuId) -> Arc<Self> {
         Arc::new_cyclic(|worker_ref| {
             let weal_worker = worker_ref.clone();
             let task_fn = Box::new(move || {
@@ -50,14 +52,12 @@ impl Worker {
             cpu_affinity.add(bound_cpu);
             let mut priority = Priority::default();
             if worker_pool.upgrade().unwrap().is_high_priority() {
-                // FIXME: remove the use of real-time priority.
-                priority = Priority::new(PriorityRange::new(0));
+                priority = Priority::default_real_time();
             }
-            let bound_task = create_new_kernel_task(
-                ThreadOptions::new(task_fn)
-                    .cpu_affinity(cpu_affinity)
-                    .priority(priority),
-            );
+            let bound_task = ThreadOptions::new(task_fn)
+                .cpu_affinity(cpu_affinity)
+                .priority(priority)
+                .build();
             Self {
                 worker_pool,
                 bound_task,
@@ -70,7 +70,7 @@ impl Worker {
     }
 
     pub(super) fn run(&self) {
-        let thread = Thread::borrow_from_task(&self.bound_task);
+        let thread = self.bound_task.as_thread().unwrap();
         thread.run();
     }
 

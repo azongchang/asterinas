@@ -18,7 +18,7 @@ pub fn sys_renameat(
     new_path_addr: Vaddr,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     let old_path = user_space.read_cstring(old_path_addr, MAX_FILENAME_LEN)?;
     let new_path = user_space.read_cstring(new_path_addr, MAX_FILENAME_LEN)?;
     debug!(
@@ -26,7 +26,7 @@ pub fn sys_renameat(
         old_dirfd, old_path, new_dirfd, new_path
     );
 
-    let fs = ctx.process.fs().read();
+    let fs = ctx.posix_thread.fs().resolver().read();
 
     let (old_dir_dentry, old_name) = {
         let old_path = old_path.to_string_lossy();

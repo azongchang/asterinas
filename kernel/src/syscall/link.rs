@@ -18,7 +18,7 @@ pub fn sys_linkat(
     flags: u32,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
 
     let old_path = user_space.read_cstring(old_path_addr, MAX_FILENAME_LEN)?;
     let new_path = user_space.read_cstring(new_path_addr, MAX_FILENAME_LEN)?;
@@ -44,7 +44,7 @@ pub fn sys_linkat(
 
         let old_fs_path = FsPath::new(old_dirfd, old_path.as_ref())?;
         let new_fs_path = FsPath::new(new_dirfd, new_path.as_ref())?;
-        let fs = ctx.process.fs().read();
+        let fs = ctx.posix_thread.fs().resolver().read();
         let old_dentry = if flags.contains(LinkFlags::AT_SYMLINK_FOLLOW) {
             fs.lookup(&old_fs_path)?
         } else {

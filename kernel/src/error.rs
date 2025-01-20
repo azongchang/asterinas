@@ -150,6 +150,8 @@ pub enum Errno {
     ERFKILL = 132, /* Operation not possible due to RF-kill */
 
     EHWPOISON = 133, /* Memory page has hardware error */
+
+    ERESTARTSYS = 512, /* Restart of an interrupted system call. For kernel internal use only. */
 }
 
 /// error used in this crate
@@ -199,6 +201,7 @@ impl From<ostd::Error> for Error {
             ostd::Error::PageFault => Error::new(Errno::EFAULT),
             ostd::Error::Overflow => Error::new(Errno::EOVERFLOW),
             ostd::Error::MapAlreadyMappedVaddr => Error::new(Errno::EINVAL),
+            ostd::Error::KVirtAreaAllocError => Error::new(Errno::ENOMEM),
         }
     }
 }

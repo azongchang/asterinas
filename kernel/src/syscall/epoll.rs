@@ -7,12 +7,15 @@ use crate::{
     events::IoEvents,
     fs::{
         epoll::{EpollCtl, EpollEvent, EpollFile, EpollFlags},
-        file_table::{FdFlags, FileDesc},
+        file_table::{get_file_fast, FdFlags, FileDesc},
         utils::CreationFlags,
     },
     prelude::*,
     process::signal::sig_mask::SigMask,
 };
+
+// See: https://elixir.bootlin.com/linux/v6.11.5/source/fs/eventpoll.c#L2437
+const EP_MAX_EVENTS: usize = i32::MAX as usize / core::mem::size_of::<c_epoll_event>();
 
 pub fn sys_epoll_create(size: i32, ctx: &Context) -> Result<SyscallReturn> {
     if size <= 0 {
@@ -38,8 +41,8 @@ pub fn sys_epoll_create1(flags: u32, ctx: &Context) -> Result<SyscallReturn> {
     };
 
     let epoll_file: Arc<EpollFile> = EpollFile::new();
-    let mut file_table = ctx.process.file_table().lock();
-    let fd = file_table.insert(epoll_file, fd_flags);
+    let file_table = ctx.thread_local.file_table().borrow();
+    let fd = file_table.write().insert(epoll_file, fd_flags);
     Ok(SyscallReturn::Return(fd as _))
 }
 
@@ -61,14 +64,14 @@ pub fn sys_epoll_ctl(
 
     let cmd = match op {
         EPOLL_CTL_ADD => {
-            let c_epoll_event = ctx.get_user_space().read_val::<c_epoll_event>(event_addr)?;
+            let c_epoll_event = ctx.user_space().read_val::<c_epoll_event>(event_addr)?;
             let event = EpollEvent::from(&c_epoll_event);
             let flags = EpollFlags::from_bits_truncate(c_epoll_event.events);
             EpollCtl::Add(fd, event, flags)
         }
         EPOLL_CTL_DEL => EpollCtl::Del(fd),
         EPOLL_CTL_MOD => {
-            let c_epoll_event = ctx.get_user_space().read_val::<c_epoll_event>(event_addr)?;
+            let c_epoll_event = ctx.user_space().read_val::<c_epoll_event>(event_addr)?;
             let event = EpollEvent::from(&c_epoll_event);
             let flags = EpollFlags::from_bits_truncate(c_epoll_event.events);
             EpollCtl::Mod(fd, event, flags)
@@ -76,14 +79,15 @@ pub fn sys_epoll_ctl(
         _ => return_errno_with_message!(Errno::EINVAL, "invalid op"),
     };
 
-    let file = {
-        let file_table = ctx.process.file_table().lock();
-        file_table.get_file(epfd)?.clone()
-    };
+    let mut file_table = ctx.thread_local.file_table().borrow_mut();
+    let file = get_file_fast!(&mut file_table, epfd).into_owned();
+    // Drop `file_table` as `EpollFile::control` also performs `file_table().borrow_mut()`.
+    drop(file_table);
+
     let epoll_file = file
         .downcast_ref::<EpollFile>()
         .ok_or(Error::with_message(Errno::EINVAL, "not epoll file"))?;
-    epoll_file.control(&cmd)?;
+    epoll_file.control(ctx.thread_local, &cmd)?;
 
     Ok(SyscallReturn::Return(0 as _))
 }
@@ -95,8 +99,8 @@ fn do_epoll_wait(
     ctx: &Context,
 ) -> Result<Vec<EpollEvent>> {
     let max_events = {
-        if max_events <= 0 {
-            return_errno_with_message!(Errno::EINVAL, "max_events is not positive");
+        if max_events <= 0 || max_events as usize > EP_MAX_EVENTS {
+            return_errno_with_message!(Errno::EINVAL, "max_events is not valid");
         }
         max_events as usize
     };
@@ -106,13 +110,12 @@ fn do_epoll_wait(
         None
     };
 
-    let epoll_file_arc = {
-        let file_table = ctx.process.file_table().lock();
-        file_table.get_file(epfd)?.clone()
-    };
-    let epoll_file = epoll_file_arc
+    let mut file_table = ctx.thread_local.file_table().borrow_mut();
+    let file = get_file_fast!(&mut file_table, epfd);
+    let epoll_file = file
         .downcast_ref::<EpollFile>()
         .ok_or(Error::with_message(Errno::EINVAL, "not epoll file"))?;
+
     let result = epoll_file.wait(max_events, timeout.as_ref());
 
     // As mentioned in the manual, the return value should be zero if no file descriptor becomes ready
@@ -144,7 +147,7 @@ pub fn sys_epoll_wait(
 
     // Write back
     let mut write_addr = events_addr;
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     for epoll_event in epoll_events.iter() {
         let c_epoll_event = c_epoll_event::from(epoll_event);
         user_space.write_val(write_addr, &c_epoll_event)?;
@@ -156,7 +159,7 @@ pub fn sys_epoll_wait(
 
 fn set_signal_mask(set_ptr: Vaddr, ctx: &Context) -> Result<SigMask> {
     let new_mask: Option<SigMask> = if set_ptr != 0 {
-        Some(ctx.get_user_space().read_val::<u64>(set_ptr)?.into())
+        Some(ctx.user_space().read_val::<u64>(set_ptr)?.into())
     } else {
         None
     };
@@ -192,7 +195,7 @@ pub fn sys_epoll_pwait(
         epfd, events_addr, max_events, timeout, sigmask, sigset_size
     );
 
-    if sigset_size != 8 {
+    if sigmask != 0 && sigset_size != 8 {
         return_errno_with_message!(Errno::EINVAL, "sigset size is not equal to 8");
     }
 
@@ -212,7 +215,7 @@ pub fn sys_epoll_pwait(
 
     // Write back
     let mut write_addr = events_addr;
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     for event in ready_events.iter() {
         let c_event = c_epoll_event::from(event);
         user_space.write_val(write_addr, &c_event)?;

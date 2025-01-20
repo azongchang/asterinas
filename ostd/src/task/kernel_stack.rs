@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::{
-    mm::{kspace::KERNEL_PAGE_TABLE, FrameAllocOptions, Paddr, PageFlags, Segment, PAGE_SIZE},
+    impl_frame_meta_for,
+    mm::{
+        kspace::kvirt_area::{KVirtArea, Tracked},
+        page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
+        FrameAllocOptions, PAGE_SIZE,
+    },
     prelude::*,
 };
 
@@ -19,66 +24,47 @@ pub static STACK_SIZE_IN_PAGES: u32 = parse_u32_or_default(
 /// The default kernel stack size of a task, specified in pages.
 pub const DEFAULT_STACK_SIZE_IN_PAGES: u32 = 128;
 
+pub static KERNEL_STACK_SIZE: usize = STACK_SIZE_IN_PAGES as usize * PAGE_SIZE;
+
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct KernelStack {
-    segment: Segment,
+    kvirt_area: KVirtArea<Tracked>,
+    end_vaddr: Vaddr,
     has_guard_page: bool,
 }
 
-impl KernelStack {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            segment: FrameAllocOptions::new(STACK_SIZE_IN_PAGES as usize).alloc_contiguous()?,
-            has_guard_page: false,
-        })
-    }
+#[derive(Debug, Default)]
+struct KernelStackMeta;
 
-    /// Generates a kernel stack with a guard page.
-    /// An additional page is allocated and be regarded as a guard page, which should not be accessed.  
+impl_frame_meta_for!(KernelStackMeta);
+
+impl KernelStack {
+    /// Generates a kernel stack with guard pages.
+    /// 4 additional pages are allocated and regarded as guard pages, which should not be accessed.
     pub fn new_with_guard_page() -> Result<Self> {
-        let stack_segment =
-            FrameAllocOptions::new(STACK_SIZE_IN_PAGES as usize + 1).alloc_contiguous()?;
-        // FIXME: modifying the the linear mapping is bad.
-        let page_table = KERNEL_PAGE_TABLE.get().unwrap();
-        let guard_page_vaddr = {
-            let guard_page_paddr = stack_segment.start_paddr();
-            crate::mm::paddr_to_vaddr(guard_page_paddr)
+        let mut new_kvirt_area = KVirtArea::<Tracked>::new(KERNEL_STACK_SIZE + 4 * PAGE_SIZE);
+        let mapped_start = new_kvirt_area.range().start + 2 * PAGE_SIZE;
+        let mapped_end = mapped_start + KERNEL_STACK_SIZE;
+        let pages = FrameAllocOptions::new()
+            .zeroed(false)
+            .alloc_segment_with(KERNEL_STACK_SIZE / PAGE_SIZE, |_| KernelStackMeta)?;
+        let prop = PageProperty {
+            flags: PageFlags::RW,
+            cache: CachePolicy::Writeback,
+            priv_flags: PrivilegedPageFlags::empty(),
         };
-        // SAFETY: the segment allocated is not used by others so we can protect it.
-        unsafe {
-            let vaddr_range = guard_page_vaddr..guard_page_vaddr + PAGE_SIZE;
-            page_table
-                .protect_flush_tlb(&vaddr_range, |p| p.flags -= PageFlags::RW)
-                .unwrap();
-        }
+        new_kvirt_area.map_pages(mapped_start..mapped_end, pages, prop);
+
         Ok(Self {
-            segment: stack_segment,
+            kvirt_area: new_kvirt_area,
+            end_vaddr: mapped_end,
             has_guard_page: true,
         })
     }
 
-    pub fn end_paddr(&self) -> Paddr {
-        self.segment.end_paddr()
-    }
-}
-
-impl Drop for KernelStack {
-    fn drop(&mut self) {
-        if self.has_guard_page {
-            // FIXME: modifying the the linear mapping is bad.
-            let page_table = KERNEL_PAGE_TABLE.get().unwrap();
-            let guard_page_vaddr = {
-                let guard_page_paddr = self.segment.start_paddr();
-                crate::mm::paddr_to_vaddr(guard_page_paddr)
-            };
-            // SAFETY: the segment allocated is not used by others so we can protect it.
-            unsafe {
-                let vaddr_range = guard_page_vaddr..guard_page_vaddr + PAGE_SIZE;
-                page_table
-                    .protect_flush_tlb(&vaddr_range, |p| p.flags |= PageFlags::RW)
-                    .unwrap();
-            }
-        }
+    pub fn end_vaddr(&self) -> Vaddr {
+        self.end_vaddr
     }
 }
 

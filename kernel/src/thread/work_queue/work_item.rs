@@ -4,7 +4,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use ostd::cpu::CpuSet;
+use intrusive_collections::{intrusive_adapter, LinkedListAtomicLink};
+use ostd::cpu::{CpuId, CpuSet};
 
 use crate::prelude::*;
 
@@ -13,16 +14,20 @@ pub struct WorkItem {
     work_func: Box<dyn Fn() + Send + Sync>,
     cpu_affinity: CpuSet,
     was_pending: AtomicBool,
+    link: LinkedListAtomicLink,
 }
 
+intrusive_adapter!(pub(super) WorkItemAdapter = Arc<WorkItem>: WorkItem { link: LinkedListAtomicLink });
+
 impl WorkItem {
-    pub fn new(work_func: Box<dyn Fn() + Send + Sync>) -> WorkItem {
+    pub fn new(work_func: Box<dyn Fn() + Send + Sync>) -> Arc<WorkItem> {
         let cpu_affinity = CpuSet::new_full();
-        WorkItem {
+        Arc::new(WorkItem {
             work_func,
             cpu_affinity,
             was_pending: AtomicBool::new(false),
-        }
+            link: LinkedListAtomicLink::new(),
+        })
     }
 
     pub fn cpu_affinity(&self) -> &CpuSet {
@@ -33,7 +38,7 @@ impl WorkItem {
         &mut self.cpu_affinity
     }
 
-    pub(super) fn is_valid_cpu(&self, cpu_id: u32) -> bool {
+    pub(super) fn is_valid_cpu(&self, cpu_id: CpuId) -> bool {
         self.cpu_affinity.contains(cpu_id)
     }
 

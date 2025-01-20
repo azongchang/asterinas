@@ -13,12 +13,14 @@ use aster_util::{field_ptr, safe_ptr::SafePtr};
 use bitflags::bitflags;
 use log::debug;
 use ostd::{
-    io_mem::IoMem,
     mm::{DmaCoherent, FrameAllocOptions},
     offset_of, Pod,
 };
 
-use crate::{dma_buf::DmaBuf, transport::VirtioTransport};
+use crate::{
+    dma_buf::DmaBuf,
+    transport::{pci::legacy::VirtioPciLegacyTransport, ConfigManager, VirtioTransport},
+};
 
 #[derive(Debug)]
 pub enum QueueError {
@@ -40,8 +42,8 @@ pub struct VirtQueue {
     avail: SafePtr<AvailRing, DmaCoherent>,
     /// Used ring
     used: SafePtr<UsedRing, DmaCoherent>,
-    /// point to notify address
-    notify: SafePtr<u32, IoMem>,
+    /// Notify configuration manager
+    notify_config: ConfigManager<u32>,
 
     /// The index of queue
     queue_idx: u32,
@@ -58,13 +60,15 @@ pub struct VirtQueue {
     avail_idx: u16,
     /// last service used index
     last_used_idx: u16,
+    /// Whether the callback of this queue is enabled
+    is_callback_enabled: bool,
 }
 
 impl VirtQueue {
     /// Create a new VirtQueue.
     pub(crate) fn new(
         idx: u16,
-        size: u16,
+        mut size: u16,
         transport: &mut dyn VirtioTransport,
     ) -> Result<Self, QueueError> {
         if !size.is_power_of_two() {
@@ -72,27 +76,35 @@ impl VirtQueue {
         }
 
         let (descriptor_ptr, avail_ring_ptr, used_ring_ptr) = if transport.is_legacy_version() {
-            // FIXME: How about pci legacy?
-            // Currently, we use one Frame to place the descriptors and available rings, one Frame to place used rings
+            // Currently, we use one UFrame to place the descriptors and available rings, one UFrame to place used rings
             // because the virtio-mmio legacy required the address to be continuous. The max queue size is 128.
             if size > 128 {
                 return Err(QueueError::InvalidArgs);
             }
-            let desc_size = size_of::<Descriptor>() * size as usize;
+            let queue_size = transport.max_queue_size(idx).unwrap() as usize;
+            let desc_size = size_of::<Descriptor>() * queue_size;
+            size = queue_size as u16;
 
             let (seg1, seg2) = {
-                let continue_segment = FrameAllocOptions::new(2).alloc_contiguous().unwrap();
-                let seg1 = continue_segment.range(0..1);
-                let seg2 = continue_segment.range(1..2);
-                (seg1, seg2)
+                let align_size = VirtioPciLegacyTransport::QUEUE_ALIGN_SIZE;
+                let total_frames =
+                    VirtioPciLegacyTransport::calc_virtqueue_size_aligned(queue_size) / align_size;
+                let continue_segment = FrameAllocOptions::new()
+                    .alloc_segment(total_frames)
+                    .unwrap();
+
+                let avial_size = size_of::<u16>() * (3 + queue_size);
+                let seg1_frames = (desc_size + avial_size).div_ceil(align_size);
+
+                continue_segment.split(seg1_frames * align_size)
             };
             let desc_frame_ptr: SafePtr<Descriptor, DmaCoherent> =
-                SafePtr::new(DmaCoherent::map(seg1, true).unwrap(), 0);
+                SafePtr::new(DmaCoherent::map(seg1.into(), true).unwrap(), 0);
             let mut avail_frame_ptr: SafePtr<AvailRing, DmaCoherent> =
                 desc_frame_ptr.clone().cast();
             avail_frame_ptr.byte_add(desc_size);
             let used_frame_ptr: SafePtr<UsedRing, DmaCoherent> =
-                SafePtr::new(DmaCoherent::map(seg2, true).unwrap(), 0);
+                SafePtr::new(DmaCoherent::map(seg2.into(), true).unwrap(), 0);
             (desc_frame_ptr, avail_frame_ptr, used_frame_ptr)
         } else {
             if size > 256 {
@@ -100,18 +112,27 @@ impl VirtQueue {
             }
             (
                 SafePtr::new(
-                    DmaCoherent::map(FrameAllocOptions::new(1).alloc_contiguous().unwrap(), true)
-                        .unwrap(),
+                    DmaCoherent::map(
+                        FrameAllocOptions::new().alloc_segment(1).unwrap().into(),
+                        true,
+                    )
+                    .unwrap(),
                     0,
                 ),
                 SafePtr::new(
-                    DmaCoherent::map(FrameAllocOptions::new(1).alloc_contiguous().unwrap(), true)
-                        .unwrap(),
+                    DmaCoherent::map(
+                        FrameAllocOptions::new().alloc_segment(1).unwrap().into(),
+                        true,
+                    )
+                    .unwrap(),
                     0,
                 ),
                 SafePtr::new(
-                    DmaCoherent::map(FrameAllocOptions::new(1).alloc_contiguous().unwrap(), true)
-                        .unwrap(),
+                    DmaCoherent::map(
+                        FrameAllocOptions::new().alloc_segment(1).unwrap().into(),
+                        true,
+                    )
+                    .unwrap(),
                     0,
                 ),
             )
@@ -141,21 +162,22 @@ impl VirtQueue {
             }
         }
 
-        let notify = transport.get_notify_ptr(idx).unwrap();
+        let notify_config = transport.notify_config(idx as usize);
         field_ptr!(&avail_ring_ptr, AvailRing, flags)
-            .write_once(&(0u16))
+            .write_once(&AvailFlags::empty())
             .unwrap();
         Ok(VirtQueue {
             descs,
             avail: avail_ring_ptr,
             used: used_ring_ptr,
-            notify,
+            notify_config,
             queue_size: size,
             queue_idx: idx as u32,
             num_used: 0,
             free_head: 0,
             avail_idx: 0,
             last_used_idx: 0,
+            is_callback_enabled: true,
         })
     }
 
@@ -342,7 +364,49 @@ impl VirtQueue {
 
     /// notify that there are available rings
     pub fn notify(&mut self) {
-        self.notify.write_once(&self.queue_idx).unwrap();
+        if self.notify_config.is_modern() {
+            self.notify_config
+                .write_once::<u32>(0, self.queue_idx)
+                .unwrap();
+        } else {
+            self.notify_config
+                .write_once::<u16>(0, self.queue_idx as u16)
+                .unwrap();
+        }
+    }
+
+    /// Disables registered callbacks.
+    ///
+    /// That is to say, the queue won't generate interrupts after calling this method.
+    pub fn disable_callback(&mut self) {
+        if !self.is_callback_enabled {
+            return;
+        }
+
+        let flags_ptr = field_ptr!(&self.avail, AvailRing, flags);
+        let mut flags: AvailFlags = flags_ptr.read_once().unwrap();
+        debug_assert!(!flags.contains(AvailFlags::VIRTQ_AVAIL_F_NO_INTERRUPT));
+        flags.insert(AvailFlags::VIRTQ_AVAIL_F_NO_INTERRUPT);
+        flags_ptr.write_once(&flags).unwrap();
+
+        self.is_callback_enabled = false;
+    }
+
+    /// Enables registered callbacks.
+    ///
+    /// The queue will generate interrupts if any event comes after calling this method.
+    pub fn enable_callback(&mut self) {
+        if self.is_callback_enabled {
+            return;
+        }
+
+        let flags_ptr = field_ptr!(&self.avail, AvailRing, flags);
+        let mut flags: AvailFlags = flags_ptr.read_once().unwrap();
+        debug_assert!(flags.contains(AvailFlags::VIRTQ_AVAIL_F_NO_INTERRUPT));
+        flags.remove(AvailFlags::VIRTQ_AVAIL_F_NO_INTERRUPT);
+        flags_ptr.write_once(&flags).unwrap();
+
+        self.is_callback_enabled = true;
     }
 }
 
@@ -387,7 +451,7 @@ bitflags! {
 #[repr(C, align(2))]
 #[derive(Debug, Copy, Clone, Pod)]
 pub struct AvailRing {
-    flags: u16,
+    flags: AvailFlags,
     /// A driver MUST NOT decrement the idx.
     idx: u16,
     ring: [u16; 64], // actual size: queue_size
@@ -412,4 +476,14 @@ pub struct UsedRing {
 pub struct UsedElem {
     id: u32,
     len: u32,
+}
+
+bitflags! {
+    /// The flags useds in [`AvailRing`]
+    #[repr(C)]
+    #[derive(Pod)]
+    pub struct AvailFlags: u16 {
+        /// The flag used to disable virt queue interrupt
+        const VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
+    }
 }

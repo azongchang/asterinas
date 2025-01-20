@@ -28,7 +28,7 @@ pub fn sys_prctl(
                 }
             };
 
-            ctx.get_user_space().write_val(write_to_addr, &write_val)?;
+            ctx.user_space().write_val(write_to_addr, &write_val)?;
         }
         PrctlCmd::PR_GET_DUMPABLE => {
             // TODO: when coredump is supported, return the actual value
@@ -41,11 +41,30 @@ pub fn sys_prctl(
 
             // TODO: implement coredump
         }
+        PrctlCmd::PR_GET_KEEPCAPS => {
+            let keep_cap = {
+                let credentials = ctx.posix_thread.credentials();
+                if credentials.keep_capabilities() {
+                    1
+                } else {
+                    0
+                }
+            };
+
+            return Ok(SyscallReturn::Return(keep_cap as _));
+        }
+        PrctlCmd::PR_SET_KEEPCAPS(keep_cap) => {
+            if keep_cap > 1 {
+                return_errno!(Errno::EINVAL)
+            }
+            let credentials = ctx.posix_thread.credentials_mut();
+            credentials.set_keep_capabilities(keep_cap != 0);
+        }
         PrctlCmd::PR_GET_NAME(write_to_addr) => {
             let thread_name = ctx.posix_thread.thread_name().lock();
             if let Some(thread_name) = &*thread_name {
                 if let Some(thread_name) = thread_name.name()? {
-                    ctx.get_user_space().write_bytes(
+                    ctx.user_space().write_bytes(
                         write_to_addr,
                         &mut VmReader::from(thread_name.to_bytes_with_nul()),
                     )?;
@@ -56,7 +75,7 @@ pub fn sys_prctl(
             let mut thread_name = ctx.posix_thread.thread_name().lock();
             if let Some(thread_name) = &mut *thread_name {
                 let new_thread_name = ctx
-                    .get_user_space()
+                    .user_space()
                     .read_cstring(read_addr, MAX_THREAD_NAME_LEN)?;
                 thread_name.set_name(&new_thread_name)?;
             }
@@ -70,6 +89,8 @@ const PR_SET_PDEATHSIG: i32 = 1;
 const PR_GET_PDEATHSIG: i32 = 2;
 const PR_GET_DUMPABLE: i32 = 3;
 const PR_SET_DUMPABLE: i32 = 4;
+const PR_GET_KEEPCAPS: i32 = 7;
+const PR_SET_KEEPCAPS: i32 = 8;
 const PR_SET_NAME: i32 = 15;
 const PR_GET_NAME: i32 = 16;
 const PR_SET_TIMERSLACK: i32 = 29;
@@ -82,6 +103,8 @@ pub enum PrctlCmd {
     PR_GET_PDEATHSIG(Vaddr),
     PR_SET_NAME(Vaddr),
     PR_GET_NAME(Vaddr),
+    PR_GET_KEEPCAPS,
+    PR_SET_KEEPCAPS(u32),
     #[allow(dead_code)]
     PR_SET_TIMERSLACK(u64),
     #[allow(dead_code)]
@@ -112,6 +135,8 @@ impl PrctlCmd {
             PR_GET_NAME => Ok(PrctlCmd::PR_GET_NAME(arg2 as _)),
             PR_GET_TIMERSLACK => todo!(),
             PR_SET_TIMERSLACK => todo!(),
+            PR_GET_KEEPCAPS => Ok(PrctlCmd::PR_GET_KEEPCAPS),
+            PR_SET_KEEPCAPS => Ok(PrctlCmd::PR_SET_KEEPCAPS(arg2 as _)),
             _ => {
                 debug!("prctl cmd number: {}", option);
                 return_errno_with_message!(Errno::EINVAL, "unsupported prctl command");

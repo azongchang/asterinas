@@ -17,7 +17,7 @@ use crate::{
         bin::{AsterBin, AsterBinType, AsterBzImageMeta, AsterElfMeta},
         file::BundleFile,
     },
-    util::get_current_crate_info,
+    util::{get_current_crate_info, hard_link_or_copy},
 };
 
 pub fn make_install_bzimage(
@@ -115,7 +115,7 @@ pub fn make_elf_for_qemu(install_dir: impl AsRef<Path>, elf: &AsterBin, strip: b
         }
     } else {
         // Copy the ELF file.
-        std::fs::copy(elf.path(), &result_elf_path).unwrap();
+        hard_link_or_copy(elf.path(), &result_elf_path).unwrap();
     }
 
     if elf.arch() == Arch::X86_64 {
@@ -167,7 +167,37 @@ fn install_setup_with_arch(
     let target_dir = std::fs::canonicalize(target_dir).unwrap();
 
     let mut cmd = Command::new("cargo");
-    cmd.env("RUSTFLAGS", "-Ccode-model=kernel -Crelocation-model=pie -Ctarget-feature=+crt-static -Zplt=yes -Zrelax-elf-relocations=yes -Crelro-level=full");
+    let mut rustflags = vec![
+        "-Cdebuginfo=2",
+        "-Ccode-model=kernel",
+        "-Crelocation-model=pie",
+        "-Zplt=yes",
+        "-Zrelax-elf-relocations=yes",
+        "-Crelro-level=full",
+    ];
+    let target_feature_args = match arch {
+        SetupInstallArch::X86_64 => {
+            concat!(
+                "-Ctarget-feature=",
+                "+crt-static",
+                ",-adx",
+                ",-aes",
+                ",-avx",
+                ",-avx2",
+                ",-fxsr",
+                ",-sse",
+                ",-sse2",
+                ",-sse3",
+                ",-sse4.1",
+                ",-sse4.2",
+                ",-ssse3",
+                ",-xsave",
+            )
+        }
+        SetupInstallArch::Other(_) => "-Ctarget-feature=+crt-static",
+    };
+    rustflags.push(target_feature_args);
+    cmd.env("RUSTFLAGS", rustflags.join(" "));
     cmd.arg("install").arg("linux-bzimage-setup");
     cmd.arg("--force");
     cmd.arg("--root").arg(install_dir.as_ref());
@@ -175,10 +205,9 @@ fn install_setup_with_arch(
         let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let setup_dir = crate_dir.join("../ostd/libs/linux-bzimage/setup");
         cmd.arg("--path").arg(setup_dir);
+    } else {
+        cmd.arg("--version").arg(env!("CARGO_PKG_VERSION"));
     }
-    // Remember to upgrade this version if new version of linux-bzimage-setup is released.
-    const LINUX_BZIMAGE_SETUP_VERSION: &str = "0.1.0";
-    cmd.arg("--version").arg(LINUX_BZIMAGE_SETUP_VERSION);
     cmd.arg("--target").arg(match arch {
         SetupInstallArch::X86_64 => "x86_64-unknown-none",
         SetupInstallArch::Other(path) => path.to_str().unwrap(),

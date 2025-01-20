@@ -4,16 +4,23 @@
 
 use core::sync::atomic::Ordering;
 
-use ostd::{cpu::CpuSet, sync::PreemptDisabled, task::Task};
+use ostd::{
+    cpu::{AtomicCpuSet, CpuSet},
+    task::Task,
+};
 
 use self::status::{AtomicThreadStatus, ThreadStatus};
 use crate::{
     prelude::*,
-    sched::priority::{AtomicPriority, Priority},
+    sched::{
+        priority::{AtomicPriority, Priority},
+        SchedAttr,
+    },
 };
 
 pub mod exception;
 pub mod kernel_thread;
+pub mod oops;
 pub mod status;
 pub mod task;
 pub mod work_queue;
@@ -21,6 +28,7 @@ pub mod work_queue;
 pub type Tid = u32;
 
 /// A thread is a wrapper on top of task.
+#[derive(Debug)]
 pub struct Thread {
     // immutable part
     /// Low-level info
@@ -33,8 +41,9 @@ pub struct Thread {
     status: AtomicThreadStatus,
     /// Thread priority
     priority: AtomicPriority,
-    /// Thread cpu affinity
-    cpu_affinity: SpinLock<CpuSet>,
+    /// Thread CPU affinity
+    cpu_affinity: AtomicCpuSet,
+    sched_attr: SchedAttr,
 }
 
 impl Thread {
@@ -42,16 +51,16 @@ impl Thread {
     pub fn new(
         task: Weak<Task>,
         data: impl Send + Sync + Any,
-        status: ThreadStatus,
         priority: Priority,
         cpu_affinity: CpuSet,
     ) -> Self {
         Thread {
             task,
             data: Box::new(data),
-            status: AtomicThreadStatus::new(status),
+            status: AtomicThreadStatus::new(ThreadStatus::Init),
             priority: AtomicPriority::new(priority),
-            cpu_affinity: SpinLock::new(cpu_affinity),
+            cpu_affinity: AtomicCpuSet::new(cpu_affinity),
+            sched_attr: SchedAttr::new(priority.into()),
         }
     }
 
@@ -60,44 +69,70 @@ impl Thread {
     /// This function returns `None` if the current task is not associated with
     /// a thread, or if called within the bootstrap context.
     pub fn current() -> Option<Arc<Self>> {
-        Task::current()?
-            .data()
-            .downcast_ref::<Arc<Thread>>()
-            .cloned()
+        Task::current()?.as_thread().cloned()
     }
 
-    /// Gets the Thread from task's data.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if the task is not a thread.
-    pub fn borrow_from_task(task: &Task) -> &Arc<Self> {
-        task.data().downcast_ref::<Arc<Thread>>().unwrap()
+    /// Returns the task associated with this thread.
+    pub fn task(&self) -> Arc<Task> {
+        self.task.upgrade().unwrap()
     }
 
     /// Runs this thread at once.
+    #[track_caller]
     pub fn run(&self) {
-        self.set_status(ThreadStatus::Running);
+        self.status.store(ThreadStatus::Running, Ordering::Release);
         self.task.upgrade().unwrap().run();
     }
 
+    /// Returns whether the thread is exited.
+    pub fn is_exited(&self) -> bool {
+        self.status.load(Ordering::Acquire).is_exited()
+    }
+
+    /// Returns whether the thread is stopped.
+    pub fn is_stopped(&self) -> bool {
+        self.status.load(Ordering::Acquire).is_stopped()
+    }
+
+    /// Stops the thread if it is running.
+    ///
+    /// If the previous status is not [`ThreadStatus::Running`], this function
+    /// returns [`Err`] with the previous state. Otherwise, it sets the status
+    /// to [`ThreadStatus::Stopped`] and returns [`Ok`] with the previous state.
+    ///
+    /// This function only sets the status to [`ThreadStatus::Stopped`],
+    /// without initiating a reschedule.
+    pub fn stop(&self) -> core::result::Result<ThreadStatus, ThreadStatus> {
+        self.status.compare_exchange(
+            ThreadStatus::Running,
+            ThreadStatus::Stopped,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+    }
+
+    /// Resumes running the thread if it is stopped.
+    ///
+    /// If the previous status is not [`ThreadStatus::Stopped`], this function
+    /// returns [`None`]. Otherwise, it sets the status to
+    /// [`ThreadStatus::Running`] and returns [`Some(())`].
+    ///
+    /// This function only sets the status to [`ThreadStatus::Running`],
+    /// without initiating a reschedule.
+    pub fn resume(&self) -> Option<()> {
+        self.status
+            .compare_exchange(
+                ThreadStatus::Stopped,
+                ThreadStatus::Running,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| ())
+    }
+
     pub(super) fn exit(&self) {
-        self.set_status(ThreadStatus::Exited);
-    }
-
-    /// Returns the reference to the atomic status.
-    pub fn atomic_status(&self) -> &AtomicThreadStatus {
-        &self.status
-    }
-
-    /// Returns the current status.
-    pub fn status(&self) -> ThreadStatus {
-        self.status.load(Ordering::Acquire)
-    }
-
-    /// Updates the status with the new value.
-    pub fn set_status(&self, new_status: ThreadStatus) {
-        self.status.store(new_status, Ordering::Release);
+        self.status.store(ThreadStatus::Exited, Ordering::Release);
     }
 
     /// Returns the reference to the atomic priority.
@@ -105,35 +140,47 @@ impl Thread {
         &self.priority
     }
 
-    /// Returns the current priority.
-    pub fn priority(&self) -> Priority {
-        self.priority.load(Ordering::Relaxed)
+    /// Returns the reference to the atomic CPU affinity.
+    pub fn atomic_cpu_affinity(&self) -> &AtomicCpuSet {
+        &self.cpu_affinity
     }
 
-    /// Updates the priority with the new value.
-    pub fn set_priority(&self, new_priority: Priority) {
-        self.priority.store(new_priority, Ordering::Relaxed)
+    pub fn sched_attr(&self) -> &SchedAttr {
+        &self.sched_attr
     }
 
-    /// Acquires the lock of cpu affinity.
-    pub fn lock_cpu_affinity(&self) -> SpinLockGuard<CpuSet, PreemptDisabled> {
-        self.cpu_affinity.lock()
-    }
-
-    /// Updates the cpu affinity with the new value.
-    pub fn set_cpu_affinity(&self, new_cpu_affinity: CpuSet) {
-        *self.cpu_affinity.lock() = new_cpu_affinity;
-    }
-
+    /// Yields the execution to another thread.
+    ///
+    /// This method will return once the current thread is scheduled again.
+    #[track_caller]
     pub fn yield_now() {
         Task::yield_now()
     }
 
-    /// Returns the associated data.
+    /// Joins the execution of the thread.
     ///
-    /// The return type must be borrowed box, otherwise the `downcast_ref` will fail.
-    #[allow(clippy::borrowed_box)]
-    pub fn data(&self) -> &Box<dyn Send + Sync + Any> {
-        &self.data
+    /// This method will return after the thread exits.
+    #[track_caller]
+    pub fn join(&self) {
+        while !self.is_exited() {
+            Self::yield_now();
+        }
+    }
+
+    /// Returns the associated data.
+    pub fn data(&self) -> &(dyn Send + Sync + Any) {
+        &*self.data
+    }
+}
+
+/// A trait to provide the `as_thread` method for tasks.
+pub trait AsThread {
+    /// Returns the associated [`Thread`].
+    fn as_thread(&self) -> Option<&Arc<Thread>>;
+}
+
+impl AsThread for Task {
+    fn as_thread(&self) -> Option<&Arc<Thread>> {
+        self.data().downcast_ref::<Arc<Thread>>()
     }
 }

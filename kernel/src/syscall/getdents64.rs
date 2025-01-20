@@ -5,8 +5,7 @@ use core::marker::PhantomData;
 use super::SyscallReturn;
 use crate::{
     fs::{
-        file_table::FileDesc,
-        inode_handle::InodeHandle,
+        file_table::{get_file_fast, FileDesc},
         utils::{DirentVisitor, InodeType},
     },
     prelude::*,
@@ -23,13 +22,9 @@ pub fn sys_getdents(
         fd, buf_addr, buf_len
     );
 
-    let file = {
-        let file_table = ctx.process.file_table().lock();
-        file_table.get_file(fd)?.clone()
-    };
-    let inode_handle = file
-        .downcast_ref::<InodeHandle>()
-        .ok_or(Error::with_message(Errno::EBADF, "not inode"))?;
+    let mut file_table = ctx.thread_local.file_table().borrow_mut();
+    let file = get_file_fast!(&mut file_table, fd);
+    let inode_handle = file.as_inode_or_err()?;
     if inode_handle.dentry().type_() != InodeType::Dir {
         return_errno!(Errno::ENOTDIR);
     }
@@ -37,7 +32,7 @@ pub fn sys_getdents(
     let mut reader = DirentBufferReader::<Dirent>::new(&mut buffer); // Use the non-64-bit reader
     let _ = inode_handle.readdir(&mut reader)?;
     let read_len = reader.read_len();
-    ctx.get_user_space()
+    ctx.user_space()
         .write_bytes(buf_addr, &mut VmReader::from(&buffer[..read_len]))?;
     Ok(SyscallReturn::Return(read_len as _))
 }
@@ -53,13 +48,9 @@ pub fn sys_getdents64(
         fd, buf_addr, buf_len
     );
 
-    let file = {
-        let file_table = ctx.process.file_table().lock();
-        file_table.get_file(fd)?.clone()
-    };
-    let inode_handle = file
-        .downcast_ref::<InodeHandle>()
-        .ok_or(Error::with_message(Errno::EBADF, "not inode"))?;
+    let mut file_table = ctx.thread_local.file_table().borrow_mut();
+    let file = get_file_fast!(&mut file_table, fd);
+    let inode_handle = file.as_inode_or_err()?;
     if inode_handle.dentry().type_() != InodeType::Dir {
         return_errno!(Errno::ENOTDIR);
     }
@@ -67,7 +58,7 @@ pub fn sys_getdents64(
     let mut reader = DirentBufferReader::<Dirent64>::new(&mut buffer);
     let _ = inode_handle.readdir(&mut reader)?;
     let read_len = reader.read_len();
-    ctx.get_user_space()
+    ctx.user_space()
         .write_bytes(buf_addr, &mut VmReader::from(&buffer[..read_len]))?;
     Ok(SyscallReturn::Return(read_len as _))
 }
@@ -104,7 +95,7 @@ impl<'a, T: DirentSerializer> DirentBufferReader<'a, T> {
     }
 }
 
-impl<'a, T: DirentSerializer> DirentVisitor for DirentBufferReader<'a, T> {
+impl<T: DirentSerializer> DirentVisitor for DirentBufferReader<'_, T> {
     fn visit(&mut self, name: &str, ino: u64, type_: InodeType, offset: usize) -> Result<()> {
         let dirent_serializer = T::new(ino, offset as u64, type_, CString::new(name)?);
         if self.read_len >= self.buffer.len() {

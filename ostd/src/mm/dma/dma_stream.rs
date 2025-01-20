@@ -11,7 +11,7 @@ use crate::{
     error::Error,
     mm::{
         dma::{dma_type, Daddr, DmaType},
-        HasPaddr, Infallible, Paddr, Segment, VmIo, VmReader, VmWriter, PAGE_SIZE,
+        HasPaddr, Infallible, Paddr, USegment, UntypedMem, VmIo, VmReader, VmWriter, PAGE_SIZE,
     },
 };
 
@@ -34,7 +34,7 @@ pub struct DmaStream {
 
 #[derive(Debug)]
 struct DmaStreamInner {
-    vm_segment: Segment,
+    segment: USegment,
     start_daddr: Daddr,
     /// TODO: remove this field when on x86.
     #[allow(unused)]
@@ -48,23 +48,23 @@ struct DmaStreamInner {
 pub enum DmaDirection {
     /// Data flows to the device
     ToDevice,
-    /// Data flows form the device
+    /// Data flows from the device
     FromDevice,
     /// Data flows both from and to the device
     Bidirectional,
 }
 
 impl DmaStream {
-    /// Establishes DMA stream mapping for a given [`Segment`].
+    /// Establishes DMA stream mapping for a given [`USegment`].
     ///
     /// The method fails if the segment already belongs to a DMA mapping.
     pub fn map(
-        vm_segment: Segment,
+        segment: USegment,
         direction: DmaDirection,
         is_cache_coherent: bool,
     ) -> Result<Self, DmaError> {
-        let frame_count = vm_segment.nframes();
-        let start_paddr = vm_segment.start_paddr();
+        let frame_count = segment.size() / PAGE_SIZE;
+        let start_paddr = segment.start_paddr();
         if !check_and_insert_dma_mapping(start_paddr, frame_count) {
             return Err(DmaError::AlreadyMapped);
         }
@@ -88,7 +88,7 @@ impl DmaStream {
             DmaType::Iommu => {
                 for i in 0..frame_count {
                     let paddr = start_paddr + (i * PAGE_SIZE);
-                    // SAFETY: the `paddr` is restricted by the `start_paddr` and `frame_count` of the `vm_segment`.
+                    // SAFETY: the `paddr` is restricted by the `start_paddr` and `frame_count` of the `segment`.
                     unsafe {
                         iommu::map(paddr as Daddr, paddr).unwrap();
                     }
@@ -99,7 +99,7 @@ impl DmaStream {
 
         Ok(Self {
             inner: Arc::new(DmaStreamInner {
-                vm_segment,
+                segment,
                 start_daddr,
                 is_cache_coherent,
                 direction,
@@ -107,24 +107,29 @@ impl DmaStream {
         })
     }
 
-    /// Gets the underlying [`Segment`].
+    /// Gets the underlying [`USegment`].
     ///
     /// Usually, the CPU side should not access the memory
     /// after the DMA mapping is established because
     /// there is a chance that the device is updating
     /// the memory. Do this at your own risk.
-    pub fn vm_segment(&self) -> &Segment {
-        &self.inner.vm_segment
+    pub fn segment(&self) -> &USegment {
+        &self.inner.segment
     }
 
-    /// Returns the number of frames
+    /// Returns the number of frames.
     pub fn nframes(&self) -> usize {
-        self.inner.vm_segment.nframes()
+        self.inner.segment.size() / PAGE_SIZE
     }
 
-    /// Returns the number of bytes
+    /// Returns the number of bytes.
     pub fn nbytes(&self) -> usize {
-        self.inner.vm_segment.nbytes()
+        self.inner.segment.size()
+    }
+
+    /// Returns the DMA direction.
+    pub fn direction(&self) -> DmaDirection {
+        self.inner.direction
     }
 
     /// Synchronizes the streaming DMA mapping with the device.
@@ -151,7 +156,7 @@ impl DmaStream {
                 if self.inner.is_cache_coherent {
                     return Ok(());
                 }
-                let start_va = self.inner.vm_segment.as_ptr();
+                let start_va = crate::mm::paddr_to_vaddr(self.inner.segment.paddr()) as *const u8;
                 // TODO: Query the CPU for the cache line size via CPUID, we use 64 bytes as the cache line size here.
                 for i in _byte_range.step_by(64) {
                     // TODO: Call the cache line flush command in the corresponding architecture.
@@ -171,8 +176,8 @@ impl HasDaddr for DmaStream {
 
 impl Drop for DmaStreamInner {
     fn drop(&mut self) {
-        let frame_count = self.vm_segment.nframes();
-        let start_paddr = self.vm_segment.start_paddr();
+        let frame_count = self.segment.size() / PAGE_SIZE;
+        let start_paddr = self.segment.start_paddr();
         // Ensure that the addresses used later will not overflow
         start_paddr.checked_add(frame_count * PAGE_SIZE).unwrap();
         match dma_type() {
@@ -206,7 +211,7 @@ impl VmIo for DmaStream {
         if self.inner.direction == DmaDirection::ToDevice {
             return Err(Error::AccessDenied);
         }
-        self.inner.vm_segment.read(offset, writer)
+        self.inner.segment.read(offset, writer)
     }
 
     /// Writes data from the buffer.
@@ -214,7 +219,7 @@ impl VmIo for DmaStream {
         if self.inner.direction == DmaDirection::FromDevice {
             return Err(Error::AccessDenied);
         }
-        self.inner.vm_segment.write(offset, reader)
+        self.inner.segment.write(offset, reader)
     }
 }
 
@@ -224,7 +229,7 @@ impl<'a> DmaStream {
         if self.inner.direction == DmaDirection::ToDevice {
             return Err(Error::AccessDenied);
         }
-        Ok(self.inner.vm_segment.reader())
+        Ok(self.inner.segment.reader())
     }
 
     /// Returns a writer to write data into it.
@@ -232,25 +237,31 @@ impl<'a> DmaStream {
         if self.inner.direction == DmaDirection::FromDevice {
             return Err(Error::AccessDenied);
         }
-        Ok(self.inner.vm_segment.writer())
+        Ok(self.inner.segment.writer())
     }
 }
 
 impl HasPaddr for DmaStream {
     fn paddr(&self) -> Paddr {
-        self.inner.vm_segment.start_paddr()
+        self.inner.segment.start_paddr()
+    }
+}
+
+impl AsRef<DmaStream> for DmaStream {
+    fn as_ref(&self) -> &DmaStream {
+        self
     }
 }
 
 /// A slice of streaming DMA mapping.
 #[derive(Debug)]
-pub struct DmaStreamSlice<'a> {
-    stream: &'a DmaStream,
+pub struct DmaStreamSlice<Dma> {
+    stream: Dma,
     offset: usize,
     len: usize,
 }
 
-impl<'a> DmaStreamSlice<'a> {
+impl<Dma: AsRef<DmaStream>> DmaStreamSlice<Dma> {
     /// Constructs a `DmaStreamSlice` from the [`DmaStream`].
     ///
     /// # Panics
@@ -259,15 +270,25 @@ impl<'a> DmaStreamSlice<'a> {
     /// this method will panic.
     /// If the `offset + len` is greater than the length of the stream,
     /// this method will panic.
-    pub fn new(stream: &'a DmaStream, offset: usize, len: usize) -> Self {
-        assert!(offset < stream.nbytes());
-        assert!(offset + len <= stream.nbytes());
+    pub fn new(stream: Dma, offset: usize, len: usize) -> Self {
+        assert!(offset < stream.as_ref().nbytes());
+        assert!(offset + len <= stream.as_ref().nbytes());
 
         Self {
             stream,
             offset,
             len,
         }
+    }
+
+    /// Returns the underlying `DmaStream`.
+    pub fn stream(&self) -> &DmaStream {
+        self.stream.as_ref()
+    }
+
+    /// Returns the offset of the slice.
+    pub fn offset(&self) -> usize {
+        self.offset
     }
 
     /// Returns the number of bytes.
@@ -277,35 +298,69 @@ impl<'a> DmaStreamSlice<'a> {
 
     /// Synchronizes the slice of streaming DMA mapping with the device.
     pub fn sync(&self) -> Result<(), Error> {
-        self.stream.sync(self.offset..self.offset + self.len)
+        self.stream
+            .as_ref()
+            .sync(self.offset..self.offset + self.len)
+    }
+
+    /// Returns a reader to read data from it.
+    pub fn reader(&self) -> Result<VmReader<Infallible>, Error> {
+        let stream_reader = self
+            .stream
+            .as_ref()
+            .reader()?
+            .skip(self.offset)
+            .limit(self.len);
+        Ok(stream_reader)
+    }
+
+    /// Returns a writer to write data into it.
+    pub fn writer(&self) -> Result<VmWriter<Infallible>, Error> {
+        let stream_writer = self
+            .stream
+            .as_ref()
+            .writer()?
+            .skip(self.offset)
+            .limit(self.len);
+        Ok(stream_writer)
     }
 }
 
-impl VmIo for DmaStreamSlice<'_> {
+impl<Dma: AsRef<DmaStream> + Send + Sync> VmIo for DmaStreamSlice<Dma> {
     fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<(), Error> {
         if writer.avail() + offset > self.len {
             return Err(Error::InvalidArgs);
         }
-        self.stream.read(self.offset + offset, writer)
+        self.stream.as_ref().read(self.offset + offset, writer)
     }
 
     fn write(&self, offset: usize, reader: &mut VmReader) -> Result<(), Error> {
         if reader.remain() + offset > self.len {
             return Err(Error::InvalidArgs);
         }
-        self.stream.write(self.offset + offset, reader)
+        self.stream.as_ref().write(self.offset + offset, reader)
     }
 }
 
-impl HasDaddr for DmaStreamSlice<'_> {
+impl<Dma: AsRef<DmaStream>> HasDaddr for DmaStreamSlice<Dma> {
     fn daddr(&self) -> Daddr {
-        self.stream.daddr() + self.offset
+        self.stream.as_ref().daddr() + self.offset
     }
 }
 
-impl HasPaddr for DmaStreamSlice<'_> {
+impl<Dma: AsRef<DmaStream>> HasPaddr for DmaStreamSlice<Dma> {
     fn paddr(&self) -> Paddr {
-        self.stream.paddr() + self.offset
+        self.stream.as_ref().paddr() + self.offset
+    }
+}
+
+impl Clone for DmaStreamSlice<DmaStream> {
+    fn clone(&self) -> Self {
+        Self {
+            stream: self.stream.clone(),
+            offset: self.offset,
+            len: self.len,
+        }
     }
 }
 
@@ -318,36 +373,35 @@ mod test {
 
     #[ktest]
     fn streaming_map() {
-        let vm_segment = FrameAllocOptions::new(1)
-            .is_contiguous(true)
-            .alloc_contiguous()
+        let segment = FrameAllocOptions::new()
+            .alloc_segment_with(1, |_| ())
             .unwrap();
         let dma_stream =
-            DmaStream::map(vm_segment.clone(), DmaDirection::Bidirectional, true).unwrap();
-        assert!(dma_stream.paddr() == vm_segment.paddr());
+            DmaStream::map(segment.clone().into(), DmaDirection::Bidirectional, true).unwrap();
+        assert!(dma_stream.paddr() == segment.start_paddr());
     }
 
     #[ktest]
     fn duplicate_map() {
-        let vm_segment_parent = FrameAllocOptions::new(2)
-            .is_contiguous(true)
-            .alloc_contiguous()
+        let segment_parent = FrameAllocOptions::new()
+            .alloc_segment_with(2, |_| ())
             .unwrap();
-        let vm_segment_child = vm_segment_parent.range(0..1);
+        let segment_child = segment_parent.slice(&(0..PAGE_SIZE));
         let dma_stream_parent =
-            DmaStream::map(vm_segment_parent, DmaDirection::Bidirectional, false);
-        let dma_stream_child = DmaStream::map(vm_segment_child, DmaDirection::Bidirectional, false);
+            DmaStream::map(segment_parent.into(), DmaDirection::Bidirectional, false);
+        let dma_stream_child =
+            DmaStream::map(segment_child.into(), DmaDirection::Bidirectional, false);
         assert!(dma_stream_parent.is_ok());
         assert!(dma_stream_child.is_err());
     }
 
     #[ktest]
     fn read_and_write() {
-        let vm_segment = FrameAllocOptions::new(2)
-            .is_contiguous(true)
-            .alloc_contiguous()
+        let segment = FrameAllocOptions::new()
+            .alloc_segment_with(2, |_| ())
             .unwrap();
-        let dma_stream = DmaStream::map(vm_segment, DmaDirection::Bidirectional, false).unwrap();
+        let dma_stream =
+            DmaStream::map(segment.into(), DmaDirection::Bidirectional, false).unwrap();
 
         let buf_write = vec![1u8; 2 * PAGE_SIZE];
         dma_stream.write_bytes(0, &buf_write).unwrap();
@@ -359,11 +413,11 @@ mod test {
 
     #[ktest]
     fn reader_and_writer() {
-        let vm_segment = FrameAllocOptions::new(2)
-            .is_contiguous(true)
-            .alloc_contiguous()
+        let segment = FrameAllocOptions::new()
+            .alloc_segment_with(2, |_| ())
             .unwrap();
-        let dma_stream = DmaStream::map(vm_segment, DmaDirection::Bidirectional, false).unwrap();
+        let dma_stream =
+            DmaStream::map(segment.into(), DmaDirection::Bidirectional, false).unwrap();
 
         let buf_write = vec![1u8; PAGE_SIZE];
         let mut writer = dma_stream.writer().unwrap();

@@ -4,7 +4,10 @@
 
 use alloc::format;
 
-use ostd::trap::{disable_local, in_interrupt_context};
+use ostd::{
+    sync::LocalIrqDisabled,
+    trap::{disable_local, in_interrupt_context},
+};
 
 use super::termio::{KernelTermios, WinSize, CC_C_CHAR};
 use crate::{
@@ -13,7 +16,7 @@ use crate::{
     process::signal::{
         constants::{SIGINT, SIGQUIT},
         signals::kernel::KernelSignal,
-        Pollee, Poller,
+        PollHandle, Pollable, Pollee,
     },
     thread::work_queue::{submit_work_item, work_item::WorkItem, WorkPriority},
     util::ring_buffer::RingBuffer,
@@ -26,23 +29,28 @@ const BUFFER_CAPACITY: usize = 4096;
 
 pub type LdiscSignalSender = Arc<dyn Fn(KernelSignal) + Send + Sync + 'static>;
 
+// Lock ordering to prevent deadlock (circular dependencies):
+// 1. `termios`
+// 2. `current_line`
+// 3. `read_buffer`
+// 4. `work_item_para`
 pub struct LineDiscipline {
-    /// current line
-    current_line: SpinLock<CurrentLine>,
+    /// Current line
+    current_line: SpinLock<CurrentLine, LocalIrqDisabled>,
     /// The read buffer
-    read_buffer: SpinLock<RingBuffer<u8>>,
-    /// termios
-    termios: SpinLock<KernelTermios>,
-    /// Windows size,
-    winsize: SpinLock<WinSize>,
+    read_buffer: SpinLock<RingBuffer<u8>, LocalIrqDisabled>,
+    /// Termios
+    termios: SpinLock<KernelTermios, LocalIrqDisabled>,
+    /// Windows size
+    winsize: SpinLock<WinSize, LocalIrqDisabled>,
     /// Pollee
     pollee: Pollee,
     /// Used to send signal for foreground processes, when some char comes.
     send_signal: LdiscSignalSender,
-    /// work item
+    /// Work item
     work_item: Arc<WorkItem>,
     /// Parameters used by a work item.
-    work_item_para: Arc<SpinLock<LineDisciplineWorkPara>>,
+    work_item_para: Arc<SpinLock<LineDisciplineWorkPara, LocalIrqDisabled>>,
 }
 
 pub struct CurrentLine {
@@ -58,7 +66,7 @@ impl Default for CurrentLine {
 }
 
 impl CurrentLine {
-    /// read all bytes inside current line and clear current line
+    /// Reads all bytes inside current line and clear current line
     pub fn drain(&mut self) -> Vec<u8> {
         let mut ret = vec![0u8; self.buffer.len()];
         self.buffer.pop_slice(ret.as_mut_slice()).unwrap();
@@ -84,22 +92,29 @@ impl CurrentLine {
     }
 }
 
+impl Pollable for LineDiscipline {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.pollee
+            .poll_with(mask, poller, || self.check_io_events())
+    }
+}
+
 impl LineDiscipline {
-    /// Create a new line discipline
+    /// Creates a new line discipline
     pub fn new(send_signal: LdiscSignalSender) -> Arc<Self> {
         Arc::new_cyclic(move |line_ref: &Weak<LineDiscipline>| {
             let line_discipline = line_ref.clone();
-            let work_item = Arc::new(WorkItem::new(Box::new(move || {
+            let work_item = WorkItem::new(Box::new(move || {
                 if let Some(line_discipline) = line_discipline.upgrade() {
-                    line_discipline.update_readable_state_after();
+                    line_discipline.send_signal_after();
                 }
-            })));
+            }));
             Self {
                 current_line: SpinLock::new(CurrentLine::default()),
                 read_buffer: SpinLock::new(RingBuffer::new(BUFFER_CAPACITY)),
                 termios: SpinLock::new(KernelTermios::default()),
                 winsize: SpinLock::new(WinSize::default()),
-                pollee: Pollee::new(IoEvents::empty()),
+                pollee: Pollee::new(),
                 send_signal,
                 work_item,
                 work_item_para: Arc::new(SpinLock::new(LineDisciplineWorkPara::new())),
@@ -107,9 +122,9 @@ impl LineDiscipline {
         })
     }
 
-    /// Push char to line discipline.
+    /// Pushes a char to the line discipline
     pub fn push_char<F2: FnMut(&str)>(&self, ch: u8, echo_callback: F2) {
-        let termios = self.termios.disable_irq().lock();
+        let termios = self.termios.lock();
 
         let ch = if termios.contains_icrnl() && ch == b'\r' {
             b'\n'
@@ -130,8 +145,8 @@ impl LineDiscipline {
 
         // Raw mode
         if !termios.is_canonical_mode() {
-            self.read_buffer.disable_irq().lock().push_overwrite(ch);
-            self.update_readable_state();
+            self.read_buffer.lock().push_overwrite(ch);
+            self.pollee.notify(IoEvents::IN);
             return;
         }
 
@@ -139,12 +154,12 @@ impl LineDiscipline {
 
         if ch == *termios.get_special_char(CC_C_CHAR::VKILL) {
             // Erase current line
-            self.current_line.disable_irq().lock().drain();
+            self.current_line.lock().drain();
         }
 
         if ch == *termios.get_special_char(CC_C_CHAR::VERASE) {
             // Type backspace
-            let mut current_line = self.current_line.disable_irq().lock();
+            let mut current_line = self.current_line.lock();
             if !current_line.is_empty() {
                 current_line.backspace();
             }
@@ -152,20 +167,19 @@ impl LineDiscipline {
 
         if is_line_terminator(ch, &termios) {
             // If a new line is met, all bytes in current_line will be moved to read_buffer
-            let mut current_line = self.current_line.disable_irq().lock();
+            let mut current_line = self.current_line.lock();
             current_line.push_char(ch);
             let current_line_chars = current_line.drain();
             for char in current_line_chars {
-                self.read_buffer.disable_irq().lock().push_overwrite(char);
+                self.read_buffer.lock().push_overwrite(char);
+                self.pollee.notify(IoEvents::IN);
             }
         }
 
         if is_printable_char(ch) {
             // Printable character
-            self.current_line.disable_irq().lock().push_char(ch);
+            self.current_line.lock().push_char(ch);
         }
-
-        self.update_readable_state();
     }
 
     fn may_send_signal(&self, termios: &KernelTermios, ch: u8) -> bool {
@@ -181,7 +195,7 @@ impl LineDiscipline {
 
         if in_interrupt_context() {
             // `kernel_signal()` may cause sleep, so only construct parameters here.
-            self.work_item_para.disable_irq().lock().kernel_signal = Some(signal);
+            self.work_item_para.lock().kernel_signal = Some(signal);
         } else {
             (self.send_signal)(signal);
         }
@@ -189,48 +203,21 @@ impl LineDiscipline {
         true
     }
 
-    pub fn update_readable_state(&self) {
-        let buffer = self.read_buffer.disable_irq().lock();
-
-        if in_interrupt_context() {
-            // Add/Del events may sleep, so only construct parameters here.
-            if !buffer.is_empty() {
-                self.work_item_para.disable_irq().lock().pollee_type = Some(PolleeType::Add);
-            } else {
-                self.work_item_para.disable_irq().lock().pollee_type = Some(PolleeType::Del);
-            }
-            submit_work_item(self.work_item.clone(), WorkPriority::High);
-            return;
-        }
+    fn check_io_events(&self) -> IoEvents {
+        let buffer = self.read_buffer.lock();
 
         if !buffer.is_empty() {
-            self.pollee.add_events(IoEvents::IN);
+            IoEvents::IN
         } else {
-            self.pollee.del_events(IoEvents::IN);
+            IoEvents::empty()
         }
     }
 
-    /// include all operations that may cause sleep, and processes by a work queue.
-    fn update_readable_state_after(&self) {
-        if let Some(signal) = self
-            .work_item_para
-            .disable_irq()
-            .lock()
-            .kernel_signal
-            .take()
-        {
+    /// Sends a signal later. The signal will be handled by a work queue.
+    fn send_signal_after(&self) {
+        if let Some(signal) = self.work_item_para.lock().kernel_signal.take() {
             (self.send_signal)(signal);
         };
-        if let Some(pollee_type) = self.work_item_para.disable_irq().lock().pollee_type.take() {
-            match pollee_type {
-                PolleeType::Add => {
-                    self.pollee.add_events(IoEvents::IN);
-                }
-                PolleeType::Del => {
-                    self.pollee.del_events(IoEvents::IN);
-                }
-            }
-        }
     }
 
     // TODO: respect output flags
@@ -240,7 +227,7 @@ impl LineDiscipline {
             b'\r' => echo_callback("\r\n"),
             ch if ch == *termios.get_special_char(CC_C_CHAR::VERASE) => {
                 // write a space to overwrite current character
-                let backspace: &str = core::str::from_utf8(&[b'\x08', b' ', b'\x08']).unwrap();
+                let backspace: &str = core::str::from_utf8(b"\x08 \x08").unwrap();
                 echo_callback(backspace);
             }
             ch if is_printable_char(ch) => print!("{}", char::from(ch)),
@@ -253,31 +240,21 @@ impl LineDiscipline {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        loop {
-            let res = self.try_read(buf);
-            match res {
-                Ok(len) => return Ok(len),
-                Err(e) if e.error() != Errno::EAGAIN => return Err(e),
-                Err(_) => {
-                    let mut poller = Poller::new();
-                    if self.poll(IoEvents::IN, Some(&mut poller)).is_empty() {
-                        poller.wait()?
-                    }
-                }
-            }
-        }
+        self.wait_events(IoEvents::IN, None, || self.try_read(buf))
     }
 
-    /// read all bytes buffered to dst, return the actual read length.
+    /// Reads all bytes buffered to `dst`.
+    ///
+    /// This method returns the actual read length.
     fn try_read(&self, dst: &mut [u8]) -> Result<usize> {
         let (vmin, vtime) = {
-            let termios = self.termios.disable_irq().lock();
+            let termios = self.termios.lock();
             let vmin = *termios.get_special_char(CC_C_CHAR::VMIN);
             let vtime = *termios.get_special_char(CC_C_CHAR::VTIME);
             (vmin, vtime)
         };
         let read_len = {
-            let len = self.read_buffer.disable_irq().lock().len();
+            let len = self.read_buffer.lock().len();
             let max_read_len = len.min(dst.len());
             if vmin == 0 && vtime == 0 {
                 // poll read
@@ -293,18 +270,16 @@ impl LineDiscipline {
                 unreachable!()
             }
         };
-        self.update_readable_state();
+        self.pollee.invalidate();
         Ok(read_len)
     }
 
-    pub fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
-        self.pollee.poll(mask, poller)
-    }
-
-    /// returns immediately with the lesser of the number of bytes available or the number of bytes requested.
-    /// If no bytes are available, completes immediately, returning 0.
+    /// Reads bytes from `self` to `dst`, returning the actual bytes read.
+    ///
+    /// If no bytes are available, this method returns 0 immediately.
     fn poll_read(&self, dst: &mut [u8]) -> usize {
-        let mut buffer = self.read_buffer.disable_irq().lock();
+        let termios = self.termios.lock();
+        let mut buffer = self.read_buffer.lock();
         let len = buffer.len();
         let max_read_len = len.min(dst.len());
         if max_read_len == 0 {
@@ -313,7 +288,6 @@ impl LineDiscipline {
         let mut read_len = 0;
         for dst_i in dst.iter_mut().take(max_read_len) {
             if let Some(next_char) = buffer.pop() {
-                let termios = self.termios.disable_irq().lock();
                 if termios.is_canonical_mode() {
                     // canonical mode, read until meet new line
                     if is_line_terminator(next_char, &termios) {
@@ -341,8 +315,13 @@ impl LineDiscipline {
         read_len
     }
 
-    // The read() blocks until the number of bytes requested or
-    // at least vmin bytes are available, and returns the real read value.
+    /// Reads bytes from `self` into `dst`,
+    /// returning the actual number of bytes read.
+    ///
+    /// # Errors
+    ///
+    /// If the available bytes are fewer than `min(dst.len(), vmin)`,
+    /// this method returns [`Errno::EAGAIN`].
     pub fn block_read(&self, dst: &mut [u8], vmin: u8) -> Result<usize> {
         let _guard = disable_local();
         let buffer_len = self.read_buffer.lock().len();
@@ -355,27 +334,23 @@ impl LineDiscipline {
         Ok(self.poll_read(&mut dst[..buffer_len]))
     }
 
-    /// write bytes to buffer, if flush to console, then write the content to console
-    pub fn write(&self, src: &[u8], flush_to_console: bool) -> Result<usize> {
-        todo!()
-    }
-
-    /// whether there is buffered data
+    /// Returns whether there is buffered data
     pub fn is_empty(&self) -> bool {
-        self.read_buffer.disable_irq().lock().len() == 0
+        self.read_buffer.lock().len() == 0
     }
 
     pub fn termios(&self) -> KernelTermios {
-        *self.termios.disable_irq().lock()
+        *self.termios.lock()
     }
 
     pub fn set_termios(&self, termios: KernelTermios) {
-        *self.termios.disable_irq().lock() = termios;
+        *self.termios.lock() = termios;
     }
 
     pub fn drain_input(&self) {
         self.current_line.lock().drain();
         self.read_buffer.lock().clear();
+        self.pollee.invalidate();
     }
 
     pub fn buffer_len(&self) -> usize {
@@ -433,16 +408,13 @@ enum PolleeType {
 }
 
 struct LineDisciplineWorkPara {
-    #[allow(clippy::type_complexity)]
     kernel_signal: Option<KernelSignal>,
-    pollee_type: Option<PolleeType>,
 }
 
 impl LineDisciplineWorkPara {
     fn new() -> Self {
         Self {
             kernel_signal: None,
-            pollee_type: None,
         }
     }
 }

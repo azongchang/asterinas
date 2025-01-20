@@ -20,7 +20,7 @@ pub fn sys_select(
         None
     } else {
         let timeval = ctx
-            .get_user_space()
+            .user_space()
             .read_val::<timeval_t>(timeval_addr)?
             .normalize();
         Some(Duration::try_from(timeval)?)
@@ -48,7 +48,7 @@ pub fn do_sys_select(
         return_errno_with_message!(Errno::EINVAL, "nfds is negative or exceeds the FD_SETSIZE");
     }
 
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
     let get_fdset = |fdset_addr: Vaddr| -> Result<Option<FdSet>> {
         let fdset = if fdset_addr == 0 {
             None
@@ -72,7 +72,7 @@ pub fn do_sys_select(
         readfds.as_mut(),
         writefds.as_mut(),
         exceptfds.as_mut(),
-        timeout,
+        timeout.as_ref(),
         ctx,
     )?;
 
@@ -100,7 +100,7 @@ fn do_select(
     mut readfds: Option<&mut FdSet>,
     mut writefds: Option<&mut FdSet>,
     mut exceptfds: Option<&mut FdSet>,
-    timeout: Option<Duration>,
+    timeout: Option<&Duration>,
     ctx: &Context,
 ) -> Result<usize> {
     // Convert the FdSet to an array of PollFd
@@ -108,9 +108,9 @@ fn do_select(
         let mut poll_fds = Vec::with_capacity(nfds as usize);
         for fd in 0..nfds {
             let events = {
-                let readable = readfds.as_ref().map_or(false, |fds| fds.is_set(fd));
-                let writable = writefds.as_ref().map_or(false, |fds| fds.is_set(fd));
-                let except = exceptfds.as_ref().map_or(false, |fds| fds.is_set(fd));
+                let readable = readfds.as_ref().is_some_and(|fds| fds.is_set(fd));
+                let writable = writefds.as_ref().is_some_and(|fds| fds.is_set(fd));
+                let except = exceptfds.as_ref().is_some_and(|fds| fds.is_set(fd));
                 convert_rwe_to_events(readable, writable, except)
             };
 
@@ -146,7 +146,7 @@ fn do_select(
     for poll_fd in &poll_fds {
         let fd = poll_fd.fd().unwrap();
         let revents = poll_fd.revents().get();
-        let (readable, writable, except) = convert_events_to_rwe(&revents);
+        let (readable, writable, except) = convert_events_to_rwe(revents)?;
         if let Some(ref mut fds) = readfds
             && readable
         {
@@ -169,8 +169,8 @@ fn do_select(
     Ok(total_revents)
 }
 
-// Convert select's rwe input to poll's IoEvents input according to Linux's
-// behavior.
+/// Converts `select` RWE input to `poll` I/O event input
+/// according to Linux's behavior.
 fn convert_rwe_to_events(readable: bool, writable: bool, except: bool) -> IoEvents {
     let mut events = IoEvents::empty();
     if readable {
@@ -185,13 +185,17 @@ fn convert_rwe_to_events(readable: bool, writable: bool, except: bool) -> IoEven
     events
 }
 
-// Convert poll's IoEvents results to select's rwe results according to Linux's
-// behavior.
-fn convert_events_to_rwe(events: &IoEvents) -> (bool, bool, bool) {
+/// Converts `poll` I/O event results to `select` RWE results
+/// according to Linux's behavior.
+fn convert_events_to_rwe(events: IoEvents) -> Result<(bool, bool, bool)> {
+    if events.contains(IoEvents::NVAL) {
+        return_errno_with_message!(Errno::EBADF, "the file descriptor is invalid");
+    }
+
     let readable = events.intersects(IoEvents::IN | IoEvents::HUP | IoEvents::ERR);
     let writable = events.intersects(IoEvents::OUT | IoEvents::ERR);
     let except = events.contains(IoEvents::PRI);
-    (readable, writable, except)
+    Ok((readable, writable, except))
 }
 
 const FD_SETSIZE: usize = 1024;

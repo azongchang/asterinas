@@ -3,7 +3,7 @@
 use super::SyscallReturn;
 use crate::{
     fs::{
-        file_table::FileDesc,
+        file_table::{get_file_fast, FileDesc},
         fs_resolver::{FsPath, AT_FDCWD},
         utils::PATH_MAX,
     },
@@ -20,10 +20,8 @@ pub fn sys_fchown(fd: FileDesc, uid: i32, gid: i32, ctx: &Context) -> Result<Sys
         return Ok(SyscallReturn::Return(0));
     }
 
-    let file = {
-        let file_table = ctx.process.file_table().lock();
-        file_table.get_file(fd)?.clone()
-    };
+    let mut file_table = ctx.thread_local.file_table().borrow_mut();
+    let file = get_file_fast!(&mut file_table, fd);
     if let Some(uid) = uid {
         file.set_owner(uid)?;
     }
@@ -56,7 +54,7 @@ pub fn sys_fchownat(
     flags: u32,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let path = ctx.get_user_space().read_cstring(path_ptr, PATH_MAX)?;
+    let path = ctx.user_space().read_cstring(path_ptr, PATH_MAX)?;
     let flags = ChownFlags::from_bits(flags)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid flags"))?;
     debug!(
@@ -80,7 +78,7 @@ pub fn sys_fchownat(
     let dentry = {
         let path = path.to_string_lossy();
         let fs_path = FsPath::new(dirfd, path.as_ref())?;
-        let fs = ctx.process.fs().read();
+        let fs = ctx.posix_thread.fs().resolver().read();
         if flags.contains(ChownFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {

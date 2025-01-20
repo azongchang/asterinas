@@ -10,15 +10,18 @@ use super::{
     listener::{get_backlog, Backlog, Listener},
 };
 use crate::{
-    events::{IoEvents, Observer},
-    fs::{file_handle::FileLike, utils::StatusFlags},
+    events::IoEvents,
+    fs::{
+        file_handle::FileLike,
+        utils::{InodeMode, Metadata, StatusFlags},
+    },
     net::socket::{
         unix::UnixSocketAddr,
         util::{send_recv_flags::SendRecvFlags, socket_addr::SocketAddr, MessageHeader},
         SockShutdownCmd, Socket,
     },
     prelude::*,
-    process::signal::{Pollable, Poller},
+    process::signal::{PollHandle, Pollable},
     util::{MultiRead, MultiWrite},
 };
 
@@ -66,7 +69,7 @@ impl UnixStreamSocket {
         if self.is_nonblocking() {
             self.try_send(reader, flags)
         } else {
-            self.wait_events(IoEvents::OUT, || self.try_send(reader, flags))
+            self.wait_events(IoEvents::OUT, None, || self.try_send(reader, flags))
         }
     }
 
@@ -83,7 +86,7 @@ impl UnixStreamSocket {
         if self.is_nonblocking() {
             self.try_recv(writer, flags)
         } else {
-            self.wait_events(IoEvents::IN, || self.try_recv(writer, flags))
+            self.wait_events(IoEvents::IN, None, || self.try_recv(writer, flags))
         }
     }
 
@@ -150,7 +153,7 @@ impl UnixStreamSocket {
 }
 
 impl Pollable for UnixStreamSocket {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         let inner = self.state.read();
         match inner.as_ref() {
             State::Init(init) => init.poll(mask, poller),
@@ -161,7 +164,7 @@ impl Pollable for UnixStreamSocket {
 }
 
 impl FileLike for UnixStreamSocket {
-    fn as_socket(self: Arc<Self>) -> Option<Arc<dyn Socket>> {
+    fn as_socket(&self) -> Option<&dyn Socket> {
         Some(self)
     }
 
@@ -191,27 +194,14 @@ impl FileLike for UnixStreamSocket {
         Ok(())
     }
 
-    fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        match self.state.read().as_ref() {
-            State::Init(init) => init.register_observer(observer, mask),
-            State::Listen(listen) => listen.register_observer(observer, mask),
-            State::Connected(connected) => connected.register_observer(observer, mask),
-        }
-    }
-
-    fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        match self.state.read().as_ref() {
-            State::Init(init) => init.unregister_observer(observer),
-            State::Listen(listen) => listen.unregister_observer(observer),
-            State::Connected(connected) => connected.unregister_observer(observer),
-        }
+    fn metadata(&self) -> Metadata {
+        // This is a dummy implementation.
+        // TODO: Add "SockFS" and link `UnixStreamSocket` to it.
+        Metadata::new_socket(
+            0,
+            InodeMode::from_bits_truncate(0o140777),
+            aster_block::BLOCK_SIZE,
+        )
     }
 }
 
@@ -283,7 +273,7 @@ impl Socket for UnixStreamSocket {
         if self.is_nonblocking() {
             self.try_accept()
         } else {
-            self.wait_events(IoEvents::IN, || self.try_accept())
+            self.wait_events(IoEvents::IN, None, || self.try_accept())
         }
     }
 
@@ -325,7 +315,9 @@ impl Socket for UnixStreamSocket {
         flags: SendRecvFlags,
     ) -> Result<usize> {
         // TODO: Deal with flags
-        debug_assert!(flags.is_all_supported());
+        if !flags.is_all_supported() {
+            warn!("unsupported flags: {:?}", flags);
+        }
 
         let MessageHeader {
             control_message, ..
@@ -345,7 +337,9 @@ impl Socket for UnixStreamSocket {
         flags: SendRecvFlags,
     ) -> Result<(usize, MessageHeader)> {
         // TODO: Deal with flags
-        debug_assert!(flags.is_all_supported());
+        if !flags.is_all_supported() {
+            warn!("unsupported flags: {:?}", flags);
+        }
 
         let received_bytes = self.recv(writer, flags)?;
 

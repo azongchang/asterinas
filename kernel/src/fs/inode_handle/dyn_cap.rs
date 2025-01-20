@@ -7,24 +7,14 @@ use super::*;
 use crate::{prelude::*, process::signal::Pollable};
 
 impl InodeHandle<Rights> {
-    pub fn new(
-        dentry: Arc<Dentry>,
-        access_mode: AccessMode,
-        status_flags: StatusFlags,
-    ) -> Result<Self> {
-        let inode_mode = dentry.inode().mode()?;
-        if access_mode.is_readable() && !inode_mode.is_readable() {
-            return_errno_with_message!(Errno::EACCES, "file is not readable");
-        }
-        if access_mode.is_writable() && !inode_mode.is_writable() {
-            return_errno_with_message!(Errno::EACCES, "file is not writable");
-        }
-
+    pub fn new(dentry: Dentry, access_mode: AccessMode, status_flags: StatusFlags) -> Result<Self> {
+        let inode = dentry.inode();
+        inode.check_permission(access_mode.into())?;
         Self::new_unchecked_access(dentry, access_mode, status_flags)
     }
 
     pub fn new_unchecked_access(
-        dentry: Arc<Dentry>,
+        dentry: Dentry,
         access_mode: AccessMode,
         status_flags: StatusFlags,
     ) -> Result<Self> {
@@ -81,7 +71,7 @@ impl Clone for InodeHandle<Rights> {
 
 #[inherit_methods(from = "self.0")]
 impl Pollable for InodeHandle<Rights> {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents;
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents;
 }
 
 #[inherit_methods(from = "self.0")]
@@ -143,9 +133,5 @@ impl FileLike for InodeHandle<Rights> {
             return_errno_with_message!(Errno::EBADF, "file is not writable");
         }
         self.0.fallocate(mode, offset, len)
-    }
-
-    fn as_device(&self) -> Option<Arc<dyn Device>> {
-        self.dentry().inode().as_device()
     }
 }

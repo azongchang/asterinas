@@ -18,7 +18,7 @@ use ostd::sync::WaitQueue;
 
 use super::SyscallReturn;
 use crate::{
-    events::{IoEvents, Observer},
+    events::IoEvents,
     fs::{
         file_handle::FileLike,
         file_table::{FdFlags, FileDesc},
@@ -26,7 +26,7 @@ use crate::{
     },
     prelude::*,
     process::{
-        signal::{Pollable, Pollee, Poller},
+        signal::{PollHandle, Pollable, Pollee},
         Gid, Uid,
     },
     time::clocks::RealTimeClock,
@@ -54,13 +54,14 @@ pub fn sys_eventfd2(init_val: u64, flags: u32, ctx: &Context) -> Result<SyscallR
 fn do_sys_eventfd2(init_val: u64, flags: Flags, ctx: &Context) -> FileDesc {
     let event_file = EventFile::new(init_val, flags);
     let fd = {
-        let mut file_table = ctx.process.file_table().lock();
+        let file_table = ctx.thread_local.file_table().borrow();
+        let mut file_table_locked = file_table.write();
         let fd_flags = if flags.contains(Flags::EFD_CLOEXEC) {
             FdFlags::CLOEXEC
         } else {
             FdFlags::empty()
         };
-        file_table.insert(Arc::new(event_file), fd_flags)
+        file_table_locked.insert(Arc::new(event_file), fd_flags)
     };
     fd
 }
@@ -85,7 +86,7 @@ impl EventFile {
 
     fn new(init_val: u64, flags: Flags) -> Self {
         let counter = Mutex::new(init_val);
-        let pollee = Pollee::new(IoEvents::OUT);
+        let pollee = Pollee::new();
         let write_wait_queue = WaitQueue::new();
         Self {
             counter,
@@ -99,35 +100,47 @@ impl EventFile {
         self.flags.lock().contains(Flags::EFD_NONBLOCK)
     }
 
-    fn update_io_state(&self, counter: &MutexGuard<u64>) {
-        let is_readable = **counter != 0;
+    fn check_io_events(&self) -> IoEvents {
+        let counter = self.counter.lock();
+
+        let mut events = IoEvents::empty();
+
+        let is_readable = *counter != 0;
+        if is_readable {
+            events |= IoEvents::IN;
+        }
 
         // if it is possible to write a value of at least "1"
         // without blocking, the file is writable
-        let is_writable = **counter < Self::MAX_COUNTER_VALUE;
-
+        let is_writable = *counter < Self::MAX_COUNTER_VALUE;
         if is_writable {
-            if is_readable {
-                self.pollee.add_events(IoEvents::IN | IoEvents::OUT);
-            } else {
-                self.pollee.add_events(IoEvents::OUT);
-                self.pollee.del_events(IoEvents::IN);
-            }
-
-            self.write_wait_queue.wake_all();
-
-            return;
+            events |= IoEvents::OUT;
         }
 
-        if is_readable {
-            self.pollee.add_events(IoEvents::IN);
-            self.pollee.del_events(IoEvents::OUT);
-            return;
+        events
+    }
+
+    fn try_read(&self, writer: &mut VmWriter) -> Result<()> {
+        let mut counter = self.counter.lock();
+
+        // Wait until the counter becomes non-zero
+        if *counter == 0 {
+            return_errno_with_message!(Errno::EAGAIN, "the counter is zero");
         }
 
-        self.pollee.del_events(IoEvents::IN | IoEvents::OUT);
+        // Copy value from counter, and set the new counter value
+        if self.flags.lock().contains(Flags::EFD_SEMAPHORE) {
+            writer.write_fallible(&mut 1u64.as_bytes().into())?;
+            *counter -= 1;
+        } else {
+            writer.write_fallible(&mut (*counter).as_bytes().into())?;
+            *counter = 0;
+        }
 
-        // TODO: deal with overflow logic
+        self.pollee.notify(IoEvents::OUT);
+        self.write_wait_queue.wake_all();
+
+        Ok(())
     }
 
     /// Adds val to the counter.
@@ -143,7 +156,7 @@ impl EventFile {
 
         if new_value <= Self::MAX_COUNTER_VALUE {
             *counter = new_value;
-            self.update_io_state(&counter);
+            self.pollee.notify(IoEvents::IN);
             return Ok(());
         }
 
@@ -152,48 +165,24 @@ impl EventFile {
 }
 
 impl Pollable for EventFile {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
-        self.pollee.poll(mask, poller)
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.pollee
+            .poll_with(mask, poller, || self.check_io_events())
     }
 }
 
 impl FileLike for EventFile {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
         let read_len = core::mem::size_of::<u64>();
+
         if writer.avail() < read_len {
             return_errno_with_message!(Errno::EINVAL, "buf len is less len u64 size");
         }
 
-        loop {
-            let mut counter = self.counter.lock();
-
-            // Wait until the counter becomes non-zero
-            if *counter == 0 {
-                if self.is_nonblocking() {
-                    return_errno_with_message!(Errno::EAGAIN, "try reading event file again");
-                }
-
-                self.update_io_state(&counter);
-                drop(counter);
-
-                let mut poller = Poller::new();
-                if self.pollee.poll(IoEvents::IN, Some(&mut poller)).is_empty() {
-                    poller.wait()?;
-                }
-                continue;
-            }
-
-            // Copy value from counter, and set the new counter value
-            if self.flags.lock().contains(Flags::EFD_SEMAPHORE) {
-                writer.write_fallible(&mut 1u64.as_bytes().into())?;
-                *counter -= 1;
-            } else {
-                writer.write_fallible(&mut (*counter).as_bytes().into())?;
-                *counter = 0;
-            }
-
-            self.update_io_state(&counter);
-            break;
+        if self.is_nonblocking() {
+            self.try_read(writer)?;
+        } else {
+            self.wait_events(IoEvents::IN, None, || self.try_read(writer))?;
         }
 
         Ok(read_len)
@@ -245,23 +234,9 @@ impl FileLike for EventFile {
         Ok(())
     }
 
-    fn register_observer(
-        &self,
-        observer: Weak<dyn crate::events::Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        self.pollee.register_observer(observer, mask);
-        Ok(())
-    }
-
-    fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        self.pollee.unregister_observer(observer)
-    }
-
     fn metadata(&self) -> Metadata {
+        // This is a dummy implementation.
+        // TODO: Add "anonymous inode fs" and link `EventFile` to it.
         let now = RealTimeClock::get().read_time();
         Metadata {
             dev: 0,

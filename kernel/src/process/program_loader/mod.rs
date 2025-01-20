@@ -12,6 +12,7 @@ use crate::{
     fs::{
         fs_resolver::{FsPath, FsResolver, AT_FDCWD},
         path::Dentry,
+        utils::{InodeType, Permission},
     },
     prelude::*,
 };
@@ -25,7 +26,7 @@ use crate::{
 /// because the interpreter is usually an elf binary(e.g., /bin/bash)
 pub fn load_program_to_vm(
     process_vm: &ProcessVm,
-    elf_file: Arc<Dentry>,
+    elf_file: Dentry,
     argv: Vec<CString>,
     envp: Vec<CString>,
     fs_resolver: &FsResolver,
@@ -68,16 +69,24 @@ pub fn load_program_to_vm(
     Ok((abs_path, elf_load_info))
 }
 
-pub fn check_executable_file(dentry: &Arc<Dentry>) -> Result<()> {
+pub fn check_executable_file(dentry: &Dentry) -> Result<()> {
     if dentry.type_().is_directory() {
         return_errno_with_message!(Errno::EISDIR, "the file is a directory");
+    }
+
+    if dentry.type_() == InodeType::SymLink {
+        return_errno_with_message!(Errno::ELOOP, "the file is a symbolic link");
     }
 
     if !dentry.type_().is_regular_file() {
         return_errno_with_message!(Errno::EACCES, "the dentry is not a regular file");
     }
 
-    if !dentry.mode()?.is_executable() {
+    if dentry
+        .inode()
+        .check_permission(Permission::MAY_EXEC)
+        .is_err()
+    {
         return_errno_with_message!(Errno::EACCES, "the dentry is not executable");
     }
 

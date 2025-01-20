@@ -84,7 +84,7 @@ impl ProcessVm {
         let root_vmar = Vmar::<Full>::new_root();
         let init_stack = InitStack::new();
         let heap = Heap::new();
-        heap.alloc_and_map_vmo(&root_vmar).unwrap();
+        heap.alloc_and_map_vm(&root_vmar).unwrap();
         Self {
             root_vmar,
             heap,
@@ -111,7 +111,7 @@ impl ProcessVm {
     /// Returns a reader for reading contents from
     /// the `InitStack`.
     pub fn init_stack_reader(&self) -> InitStackReader {
-        self.init_stack.reader()
+        self.init_stack.reader(self.root_vmar().vm_space())
     }
 
     /// Returns the top address of the user stack.
@@ -136,6 +136,6 @@ impl ProcessVm {
     /// Clears existing mappings and then maps stack and heap vmo.
     pub(super) fn clear_and_map(&self) {
         self.root_vmar.clear().unwrap();
-        self.heap.alloc_and_map_vmo(&self.root_vmar).unwrap();
+        self.heap.alloc_and_map_vm(&self.root_vmar).unwrap();
     }
 }

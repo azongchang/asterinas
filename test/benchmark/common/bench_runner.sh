@@ -5,11 +5,12 @@
 
 set -e
 
-BENCHMARK_DIR="/benchmark"
+BENCHMARK_ROOT="/benchmark"
+READY_MESSAGE="The VM is ready for the benchmark."
 
-BENCH_NAME=$1
+BENCHMARK_NAME=$1
 SYSTEM="${2:-asterinas}"
-echo "Running benchmark: ${BENCH_NAME} on ${SYSTEM}"
+echo "Running benchmark: ${BENCHMARK_NAME} on ${SYSTEM}"
 
 print_help() {
     echo "Usage: $0 <benchmark_name> <system_type>"
@@ -18,17 +19,17 @@ print_help() {
 }
 
 # Validate arguments
-check_bench_name() {
-    if [ -z "${BENCH_NAME}" ] || [ -z "${SYSTEM}" ]; then
+check_benchmark_name() {
+    if [ -z "${BENCHMARK_NAME}" ] || [ -z "${SYSTEM}" ]; then
         echo "Error: Invalid arguments."
         print_help
         exit 1
     fi
 
-    local full_path="${BENCHMARK_DIR}/${BENCH_NAME}"
+    local full_path="${BENCHMARK_ROOT}/${BENCHMARK_NAME}"
 
     if ! [ -d "${full_path}" ]; then
-        echo "Directory '${BENCH_NAME}' does not exist in the benchmark directory."
+        echo "Directory '${BENCHMARK_NAME}' does not exist in the benchmark directory."
         print_help
         exit 1
     fi
@@ -45,12 +46,6 @@ prepare_system() {
     if [ "$SYSTEM" = "linux" ]; then
         # Mount necessary fs
         mount -t devtmpfs devtmpfs /dev
-        # Add drivers
-        depmod
-        modprobe failover
-        modprobe net_failover
-        modprobe virtio_net
-        modprobe virtio_blk
         # Enable network
         ip link set lo up
         ip link set eth0 up
@@ -68,15 +63,19 @@ prepare_system() {
 
 main() {
     # Check if the benchmark name is valid  
-    check_bench_name
+    check_benchmark_name
 
     # Prepare the system
     prepare_system
+    
+    # Message to notify the host script. It must align with the READY_MESSAGE in host_guest_bench_runner.sh.
+    # DO NOT REMOVE THIS LINE!!!
+    echo "${READY_MESSAGE}"
 
     # Run the benchmark
-    BENCH_SCRIPT=${BENCHMARK_DIR}/${BENCH_NAME}/run.sh
-    chmod +x ${BENCH_SCRIPT}
-    ${BENCH_SCRIPT}
+    BENCHMARK_SCRIPT=${BENCHMARK_ROOT}/${BENCHMARK_NAME}/run.sh
+    chmod +x ${BENCHMARK_SCRIPT}
+    ${BENCHMARK_SCRIPT}
 
     # Shutdown explicitly if running on Linux
     if [ "$SYSTEM" = "linux" ]; then

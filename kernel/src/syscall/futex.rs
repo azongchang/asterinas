@@ -3,7 +3,7 @@
 use core::time::Duration;
 
 use crate::{
-    get_current_userspace,
+    current_userspace,
     prelude::*,
     process::posix_thread::futex::{
         futex_op_and_flags_from_u32, futex_requeue, futex_wait, futex_wait_bitset, futex_wake,
@@ -14,7 +14,7 @@ use crate::{
         clocks::{MonotonicClock, RealTimeClock},
         timer::Timeout,
         timespec_t,
-        wait::TimerBuilder,
+        wait::ManagedTimeout,
     },
 };
 
@@ -40,13 +40,13 @@ pub fn sys_futex(
         Ok(val as usize)
     };
 
-    let get_futex_timer_builder = |timeout_addr: Vaddr| -> Result<Option<TimerBuilder<'static>>> {
+    let get_futex_timeout = |timeout_addr: Vaddr| -> Result<Option<ManagedTimeout<'static>>> {
         if timeout_addr == 0 {
             return Ok(None);
         }
 
         let timeout = {
-            let time_spec: timespec_t = get_current_userspace!().read_val(timeout_addr)?;
+            let time_spec: timespec_t = current_userspace!().read_val(timeout_addr)?;
             Duration::try_from(time_spec)?
         };
 
@@ -78,7 +78,7 @@ pub fn sys_futex(
             MonotonicClock::timer_manager()
         };
 
-        Ok(Some(TimerBuilder::new_with_timer_manager(
+        Ok(Some(ManagedTimeout::new_with_manager(
             timeout,
             timer_manager,
         )))
@@ -91,15 +91,15 @@ pub fn sys_futex(
     };
     let res = match futex_op {
         FutexOp::FUTEX_WAIT => {
-            let timer_builder = get_futex_timer_builder(utime_addr)?;
-            futex_wait(futex_addr as _, futex_val as _, timer_builder, ctx, pid).map(|_| 0)
+            let timeout = get_futex_timeout(utime_addr)?;
+            futex_wait(futex_addr as _, futex_val as _, timeout, ctx, pid).map(|_| 0)
         }
         FutexOp::FUTEX_WAIT_BITSET => {
-            let timer_builder = get_futex_timer_builder(utime_addr)?;
+            let timeout = get_futex_timeout(utime_addr)?;
             futex_wait_bitset(
                 futex_addr as _,
                 futex_val as _,
-                timer_builder,
+                timeout,
                 bitset as _,
                 ctx,
                 pid,
@@ -136,13 +136,10 @@ pub fn sys_futex(
             return_errno_with_message!(Errno::EINVAL, "unsupported futex op");
         }
     }
-    .map_err(|e| {
-        // From Linux manual, Futex returns `ETIMEDOUT` instead of `ETIME`
-        if e.error() == Errno::ETIME {
-            Error::with_message(Errno::ETIMEDOUT, "futex wait timeout")
-        } else {
-            e
-        }
+    .map_err(|err| match err.error() {
+        Errno::ETIME => Error::new(Errno::ETIMEDOUT),
+        Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+        _ => err,
     })?;
 
     debug!("futex returns, tid= {} ", ctx.posix_thread.tid());

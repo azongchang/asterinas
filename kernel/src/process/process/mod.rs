@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use self::timer_manager::PosixTimerManager;
 use super::{
-    posix_thread::{allocate_posix_tid, PosixThreadExt},
+    posix_thread::{allocate_posix_tid, AsPosixThread},
     process_table,
     process_vm::{Heap, InitStackReader, ProcessVm},
     rlimit::ResourceLimits,
@@ -14,14 +14,14 @@ use super::{
         signals::Signal,
     },
     status::ProcessStatus,
-    Credentials, TermStatus,
+    task_set::TaskSet,
+    Credentials,
 };
 use crate::{
     device::tty::open_ntty_as_controlling_terminal,
-    fs::{file_table::FileTable, fs_resolver::FsResolver, utils::FileCreationMask},
     prelude::*,
     sched::priority::{AtomicNice, Nice},
-    thread::Thread,
+    thread::{AsThread, Thread},
     time::clocks::ProfClock,
     vm::vmar::Vmar,
 };
@@ -72,7 +72,7 @@ pub struct Process {
     /// The executable path.
     executable_path: RwLock<String>,
     /// The threads
-    tasks: Mutex<Vec<Arc<Task>>>,
+    tasks: Mutex<TaskSet>,
     /// Process status
     status: ProcessStatus,
     /// Parent process
@@ -81,12 +81,6 @@ pub struct Process {
     children: Mutex<BTreeMap<Pid, Arc<Process>>>,
     /// Process group
     pub(super) process_group: Mutex<Weak<ProcessGroup>>,
-    /// File table
-    file_table: Arc<SpinLock<FileTable>>,
-    /// FsResolver
-    fs: Arc<RwMutex<FsResolver>>,
-    /// umask
-    umask: Arc<RwLock<FileCreationMask>>,
     /// resource limits
     resource_limits: Mutex<ResourceLimits>,
     /// Scheduling priority nice value
@@ -174,27 +168,16 @@ impl Process {
     ///  - the function is called in the bootstrap context;
     ///  - or if the current task is not associated with a process.
     pub fn current() -> Option<Arc<Process>> {
-        Some(
-            Task::current()?
-                .data()
-                .downcast_ref::<Arc<Thread>>()?
-                .as_posix_thread()?
-                .process(),
-        )
+        Some(Task::current()?.as_posix_thread()?.process())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn new(
         pid: Pid,
         parent: Weak<Process>,
-        tasks: Vec<Arc<Task>>,
         executable_path: String,
         process_vm: ProcessVm,
 
-        fs: Arc<RwMutex<FsResolver>>,
-        file_table: Arc<SpinLock<FileTable>>,
-
-        umask: Arc<RwLock<FileCreationMask>>,
         resource_limits: ResourceLimits,
         nice: Nice,
         sig_dispositions: Arc<Mutex<SigDispositions>>,
@@ -207,17 +190,14 @@ impl Process {
 
         Arc::new_cyclic(|process_ref: &Weak<Process>| Self {
             pid,
-            tasks: Mutex::new(tasks),
+            tasks: Mutex::new(TaskSet::new()),
             executable_path: RwLock::new(executable_path),
             process_vm,
             children_wait_queue,
-            status: ProcessStatus::new_uninit(),
+            status: ProcessStatus::default(),
             parent: ParentProcess::new(parent),
             children: Mutex::new(BTreeMap::new()),
             process_group: Mutex::new(Weak::new()),
-            file_table,
-            fs,
-            umask,
             sig_dispositions,
             parent_death_signal: AtomicSigNum::new_empty(),
             exit_signal: AtomicSigNum::new_empty(),
@@ -287,12 +267,12 @@ impl Process {
     pub fn run(&self) {
         let tasks = self.tasks.lock();
         // when run the process, the process should has only one thread
-        debug_assert!(tasks.len() == 1);
-        debug_assert!(self.is_runnable());
-        let task = tasks[0].clone();
+        debug_assert!(tasks.as_slice().len() == 1);
+        debug_assert!(!self.status().is_zombie());
+        let task = tasks.main().clone();
         // should not hold the lock when run thread
         drop(tasks);
-        let thread = Thread::borrow_from_task(&task);
+        let thread = task.as_thread().unwrap();
         thread.run();
     }
 
@@ -312,7 +292,7 @@ impl Process {
         &self.timer_manager
     }
 
-    pub fn tasks(&self) -> &Mutex<Vec<Arc<Task>>> {
+    pub fn tasks(&self) -> &Mutex<TaskSet> {
         &self.tasks
     }
 
@@ -332,13 +312,8 @@ impl Process {
         &self.nice
     }
 
-    pub fn main_thread(&self) -> Option<Arc<Thread>> {
-        self.tasks
-            .lock()
-            .iter()
-            .find(|task| task.tid() == self.pid)
-            .map(|task| Thread::borrow_from_task(task.as_ref()))
-            .cloned()
+    pub fn main_thread(&self) -> Arc<Thread> {
+        self.tasks.lock().main().as_thread().unwrap().clone()
     }
 
     // *********** Parent and child ***********
@@ -624,20 +599,6 @@ impl Process {
         self.process_vm.init_stack_reader()
     }
 
-    // ************** File system ****************
-
-    pub fn file_table(&self) -> &Arc<SpinLock<FileTable>> {
-        &self.file_table
-    }
-
-    pub fn fs(&self) -> &Arc<RwMutex<FsResolver>> {
-        &self.fs
-    }
-
-    pub fn umask(&self) -> &Arc<RwLock<FileCreationMask>> {
-        &self.umask
-    }
-
     // ****************** Signal ******************
 
     pub fn sig_dispositions(&self) -> &Arc<Mutex<SigDispositions>> {
@@ -653,7 +614,7 @@ impl Process {
     ///
     /// TODO: restrict these method with access control tool.
     pub fn enqueue_signal(&self, signal: impl Signal + Clone + 'static) {
-        if self.is_zombie() {
+        if self.status.is_zombie() {
             return;
         }
 
@@ -661,7 +622,7 @@ impl Process {
 
         // Enqueue signal to the first thread that does not block the signal
         let threads = self.tasks.lock();
-        for thread in threads.iter() {
+        for thread in threads.as_slice() {
             let posix_thread = thread.as_posix_thread().unwrap();
             if !posix_thread.has_signal_blocked(signal.num()) {
                 posix_thread.enqueue_signal(Box::new(signal));
@@ -669,8 +630,8 @@ impl Process {
             }
         }
 
-        // If all threads block the signal, enqueue signal to the first thread
-        let thread = threads.iter().next().unwrap();
+        // If all threads block the signal, enqueue signal to the main thread
+        let thread = threads.main();
         let posix_thread = thread.as_posix_thread().unwrap();
         posix_thread.enqueue_signal(Box::new(signal));
     }
@@ -703,24 +664,9 @@ impl Process {
 
     // ******************* Status ********************
 
-    fn set_runnable(&self) {
-        self.status.set_runnable();
-    }
-
-    fn is_runnable(&self) -> bool {
-        self.status.is_runnable()
-    }
-
-    pub fn is_zombie(&self) -> bool {
-        self.status.is_zombie()
-    }
-
-    pub fn set_zombie(&self, term_status: TermStatus) {
-        self.status.set_zombie(term_status);
-    }
-
-    pub fn exit_code(&self) -> ExitCode {
-        self.status.exit_code()
+    /// Returns a reference to the process status.
+    pub fn status(&self) -> &ProcessStatus {
+        &self.status
     }
 }
 
@@ -743,12 +689,8 @@ mod test {
         Process::new(
             pid,
             parent,
-            vec![],
             String::new(),
             ProcessVm::alloc(),
-            Arc::new(RwMutex::new(FsResolver::new())),
-            Arc::new(SpinLock::new(FileTable::new())),
-            Arc::new(RwLock::new(FileCreationMask::default())),
             ResourceLimits::default(),
             Nice::default(),
             Arc::new(Mutex::new(SigDispositions::default())),

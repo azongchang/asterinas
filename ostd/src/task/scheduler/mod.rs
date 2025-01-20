@@ -8,12 +8,15 @@
 mod fifo_scheduler;
 pub mod info;
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use spin::Once;
 
 use super::{preempt::cpu_local, processor, Task};
-use crate::{cpu::PinCurrentCpu, prelude::*, task::disable_preempt, timer};
+use crate::{
+    cpu::{CpuId, PinCurrentCpu},
+    prelude::*,
+    task::disable_preempt,
+    timer,
+};
 
 /// Injects a scheduler implementation into framework.
 ///
@@ -40,7 +43,7 @@ pub trait Scheduler<T = Task>: Sync + Send {
     ///
     /// If the `current` of a CPU needs to be preempted, this method returns the id of
     /// that CPU.
-    fn enqueue(&self, runnable: Arc<T>, flags: EnqueueFlags) -> Option<u32>;
+    fn enqueue(&self, runnable: Arc<T>, flags: EnqueueFlags) -> Option<CpuId>;
 
     /// Gets an immutable access to the local runqueue of the current CPU core.
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue<T>));
@@ -102,6 +105,7 @@ pub enum UpdateFlags {
 }
 
 /// Preempts the current task.
+#[track_caller]
 pub(crate) fn might_preempt() {
     if !cpu_local::should_preempt() {
         return;
@@ -109,49 +113,64 @@ pub(crate) fn might_preempt() {
     yield_now();
 }
 
-/// Blocks the current task unless `has_woken` is `true`.
-pub(crate) fn park_current(has_woken: &AtomicBool) {
+/// Blocks the current task unless `has_woken()` returns `true`.
+///
+/// Note that this method may return due to spurious wake events. It's the caller's responsibility
+/// to detect them (if necessary).
+#[track_caller]
+pub(crate) fn park_current<F>(has_woken: F)
+where
+    F: Fn() -> bool,
+{
     let mut current = None;
     let mut is_first_try = true;
-    reschedule(&mut |local_rq: &mut dyn LocalRunQueue| {
+
+    reschedule(|local_rq: &mut dyn LocalRunQueue| {
         if is_first_try {
-            if has_woken.load(Ordering::Acquire) {
+            if has_woken() {
                 return ReschedAction::DoNothing;
             }
-            current = local_rq.dequeue_current();
+
+            // Note the race conditions: the current task may be woken after the above `has_woken`
+            // check, but before the below `dequeue_current` action, we need to make sure that the
+            // wakeup event isn't lost.
+            //
+            // Currently, for the FIFO scheduler, `Scheduler::enqueue` will try to lock `local_rq`
+            // when the above race condition occurs, so it will wait until we finish calling the
+            // `dequeue_current` method and nothing bad will happen. This may need to be revisited
+            // after more complex schedulers are introduced.
+
             local_rq.update_current(UpdateFlags::Wait);
+            current = local_rq.dequeue_current();
         }
+
         if let Some(next_task) = local_rq.pick_next_current() {
             if Arc::ptr_eq(current.as_ref().unwrap(), next_task) {
                 return ReschedAction::DoNothing;
             }
-            ReschedAction::SwitchTo(next_task.clone())
-        } else {
-            is_first_try = false;
-            ReschedAction::Retry
+            return ReschedAction::SwitchTo(next_task.clone());
         }
+
+        is_first_try = false;
+        ReschedAction::Retry
     });
 }
 
 /// Unblocks a target task.
 pub(crate) fn unpark_target(runnable: Arc<Task>) {
-    let need_preempt_info = SCHEDULER
+    let preempt_cpu = SCHEDULER
         .get()
         .unwrap()
         .enqueue(runnable, EnqueueFlags::Wake);
-    if need_preempt_info.is_some() {
-        let cpu_id = need_preempt_info.unwrap();
-        let preempt_guard = disable_preempt();
-        // FIXME: send IPI to set remote CPU's need_preempt if needed.
-        if cpu_id == preempt_guard.current_cpu() {
-            cpu_local::set_need_preempt();
-        }
+    if let Some(preempt_cpu_id) = preempt_cpu {
+        set_need_preempt(preempt_cpu_id);
     }
 }
 
 /// Enqueues a newly built task.
 ///
 /// Note that the new task is not guaranteed to run at once.
+#[track_caller]
 pub(super) fn run_new_task(runnable: Arc<Task>) {
     // FIXME: remove this check for `SCHEDULER`.
     // Currently OSTD cannot know whether its user has injected a scheduler.
@@ -159,41 +178,49 @@ pub(super) fn run_new_task(runnable: Arc<Task>) {
         fifo_scheduler::init();
     }
 
-    let need_preempt_info = SCHEDULER
+    let preempt_cpu = SCHEDULER
         .get()
         .unwrap()
         .enqueue(runnable, EnqueueFlags::Spawn);
-    if need_preempt_info.is_some() {
-        let cpu_id = need_preempt_info.unwrap();
-        let preempt_guard = disable_preempt();
-        // FIXME: send IPI to set remote CPU's need_preempt if needed.
-        if cpu_id == preempt_guard.current_cpu() {
-            cpu_local::set_need_preempt();
-        }
+    if let Some(preempt_cpu_id) = preempt_cpu {
+        set_need_preempt(preempt_cpu_id);
     }
 
     might_preempt();
 }
 
+fn set_need_preempt(cpu_id: CpuId) {
+    let preempt_guard = disable_preempt();
+
+    if preempt_guard.current_cpu() == cpu_id {
+        cpu_local::set_need_preempt();
+    } else {
+        // TODO: Send IPIs to set remote CPU's `need_preempt`
+    }
+}
+
 /// Dequeues the current task from its runqueue.
 ///
 /// This should only be called if the current is to exit.
-pub(super) fn exit_current() {
-    reschedule(&mut |local_rq: &mut dyn LocalRunQueue| {
+#[track_caller]
+pub(super) fn exit_current() -> ! {
+    reschedule(|local_rq: &mut dyn LocalRunQueue| {
         let _ = local_rq.dequeue_current();
         if let Some(next_task) = local_rq.pick_next_current() {
             ReschedAction::SwitchTo(next_task.clone())
         } else {
             ReschedAction::Retry
         }
-    })
+    });
+
+    unreachable!()
 }
 
 /// Yields execution.
+#[track_caller]
 pub(super) fn yield_now() {
-    reschedule(&mut |local_rq| {
+    reschedule(|local_rq| {
         local_rq.update_current(UpdateFlags::Yield);
-
         if let Some(next_task) = local_rq.pick_next_current() {
             ReschedAction::SwitchTo(next_task.clone())
         } else {
@@ -206,7 +233,8 @@ pub(super) fn yield_now() {
 /// user-given closure.
 ///
 /// The closure makes the scheduling decision by taking the local runqueue has its input.
-fn reschedule<F>(f: &mut F)
+#[track_caller]
+fn reschedule<F>(mut f: F)
 where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
@@ -228,6 +256,10 @@ where
             }
         };
     };
+
+    // FIXME: At this point, we need to prevent the current task from being scheduled on another
+    // CPU core. However, we currently have no way to ensure this. This is a soundness hole and
+    // should be fixed. See <https://github.com/asterinas/asterinas/issues/1471> for details.
 
     cpu_local::clear_need_preempt();
     processor::switch_to_task(next_task);

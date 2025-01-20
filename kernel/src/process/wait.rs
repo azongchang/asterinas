@@ -6,7 +6,7 @@ use super::{process_filter::ProcessFilter, signal::constants::SIGCHLD, ExitCode,
 use crate::{
     prelude::*,
     process::{
-        posix_thread::{thread_table, PosixThreadExt},
+        posix_thread::{thread_table, AsPosixThread},
         process_table,
         signal::with_signal_blocked,
     },
@@ -21,6 +21,9 @@ bitflags! {
         const WEXITED = 0x4;
         const WCONTINUED = 0x8;
         const WNOWAIT = 0x01000000;
+        const WNOTHREAD = 0x20000000;
+        const WALL = 0x40000000;
+        const WCLONE = 0x80000000;
     }
 }
 
@@ -59,7 +62,9 @@ pub fn wait_child_exit(
             }
 
             // return immediately if we find a zombie child
-            let zombie_child = unwaited_children.iter().find(|child| child.is_zombie());
+            let zombie_child = unwaited_children
+                .iter()
+                .find(|child| child.status().is_zombie());
 
             if let Some(zombie_child) = zombie_child {
                 let zombie_pid = zombie_child.pid();
@@ -87,9 +92,9 @@ pub fn wait_child_exit(
 /// Free zombie child with pid, returns the exit code of child process.
 fn reap_zombie_child(process: &Process, pid: Pid) -> ExitCode {
     let child_process = process.children().lock().remove(&pid).unwrap();
-    assert!(child_process.is_zombie());
-    for task in &*child_process.tasks().lock() {
-        thread_table::remove_thread(task.tid());
+    assert!(child_process.status().is_zombie());
+    for task in child_process.tasks().lock().as_slice() {
+        thread_table::remove_thread(task.as_posix_thread().unwrap().tid());
     }
 
     // Lock order: session table -> group table -> process table -> group of process
@@ -118,6 +123,6 @@ fn reap_zombie_child(process: &Process, pid: Pid) -> ExitCode {
         }
     }
 
-    process_table_mut.remove(&child_process.pid());
-    child_process.exit_code()
+    process_table_mut.remove(child_process.pid());
+    child_process.status().exit_code()
 }

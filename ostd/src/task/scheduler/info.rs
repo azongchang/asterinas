@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::task::Task;
+use crate::{cpu::CpuId, task::Task};
 
 /// Fields of a task that OSTD will never touch.
 ///
@@ -14,12 +14,14 @@ use crate::task::Task;
 /// define them, such as
 /// [existential types](https://github.com/rust-lang/rfcs/pull/2492) do not
 /// exist yet. So we decide to define them in OSTD.
+#[derive(Debug)]
 pub struct TaskScheduleInfo {
     /// The CPU that the task would like to be running on.
     pub cpu: AtomicCpuId,
 }
 
 /// An atomic CPUID container.
+#[derive(Debug)]
 pub struct AtomicCpuId(AtomicU32);
 
 impl AtomicCpuId {
@@ -28,17 +30,22 @@ impl AtomicCpuId {
     /// An `AtomicCpuId` with `AtomicCpuId::NONE` as its inner value is empty.
     const NONE: u32 = u32::MAX;
 
-    fn new(cpu_id: u32) -> Self {
-        Self(AtomicU32::new(cpu_id))
-    }
-
     /// Sets the inner value of an `AtomicCpuId` if it's empty.
     ///
     /// The return value is a result indicating whether the new value was written
-    /// and containing the previous value.
-    pub fn set_if_is_none(&self, cpu_id: u32) -> core::result::Result<u32, u32> {
+    /// and containing the previous value. If the previous value is empty, it returns
+    /// `Ok(())`. Otherwise, it returns `Err(previous_value)` which the previous
+    /// value is a valid CPU ID.
+    pub fn set_if_is_none(&self, cpu_id: CpuId) -> core::result::Result<(), CpuId> {
         self.0
-            .compare_exchange(Self::NONE, cpu_id, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(
+                Self::NONE,
+                cpu_id.as_usize() as u32,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .map(|_| ())
+            .map_err(|prev| (prev as usize).try_into().unwrap())
     }
 
     /// Sets the inner value of an `AtomicCpuId` to `AtomicCpuId::NONE`, i.e. makes
@@ -48,19 +55,19 @@ impl AtomicCpuId {
     }
 
     /// Gets the inner value of an `AtomicCpuId`.
-    pub fn get(&self) -> Option<u32> {
+    pub fn get(&self) -> Option<CpuId> {
         let val = self.0.load(Ordering::Relaxed);
         if val == Self::NONE {
             None
         } else {
-            Some(val)
+            Some((val as usize).try_into().ok()?)
         }
     }
 }
 
 impl Default for AtomicCpuId {
     fn default() -> Self {
-        Self::new(Self::NONE)
+        Self(AtomicU32::new(Self::NONE))
     }
 }
 

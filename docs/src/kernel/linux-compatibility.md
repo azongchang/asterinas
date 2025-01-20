@@ -15,7 +15,7 @@ support the loading of Linux kernel modules.
 ## System Calls
 
 At the time of writing,
-Asterinas implements more than 160 out of the 336 system calls
+Asterinas implements 177 out of the 336 system calls
 provided by Linux on x86-64 architecture.
 
 | Numbers | Names            | Is Implemented  |
@@ -117,9 +117,9 @@ provided by Linux on x86-64 architecture.
 | 94      | lchown           | ✅              |
 | 95      | umask            | ✅              |
 | 96      | gettimeofday     | ✅              |
-| 97      | getrlimit        | ❌              |
+| 97      | getrlimit        | ✅              |
 | 98      | getrusage        | ✅              |
-| 99      | sysinfo          | ❌              |
+| 99      | sysinfo          | ✅              |
 | 100     | times            | ❌              |
 | 101     | ptrace           | ❌              |
 | 102     | getuid           | ✅              |
@@ -141,7 +141,7 @@ provided by Linux on x86-64 architecture.
 | 118     | getresuid        | ✅              |
 | 119     | setresgid        | ✅              |
 | 120     | getresgid        | ✅              |
-| 121     | getpgid          | ❌              |
+| 121     | getpgid          | ✅              |
 | 122     | setfsuid         | ✅              |
 | 123     | setfsgid         | ✅              |
 | 124     | getsid           | ✅              |
@@ -180,7 +180,7 @@ provided by Linux on x86-64 architecture.
 | 157     | prctl            | ✅              |
 | 158     | arch_prctl       | ✅              |
 | 159     | adjtimex         | ❌              |
-| 160     | setrlimit        | ❌              |
+| 160     | setrlimit        | ✅              |
 | 161     | chroot           | ✅              |
 | 162     | sync             | ✅              |
 | 163     | acct             | ❌              |
@@ -223,7 +223,7 @@ provided by Linux on x86-64 architecture.
 | 200     | tkill            | ❌              |
 | 201     | time             | ✅              |
 | 202     | futex            | ✅              |
-| 203     | sched_setaffinity | ❌             |
+| 203     | sched_setaffinity | ✅             |
 | 204     | sched_getaffinity | ✅             |
 | 205     | set_thread_area  | ❌              |
 | 206     | io_setup         | ❌              |
