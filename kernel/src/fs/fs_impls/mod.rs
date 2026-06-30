@@ -16,6 +16,7 @@ pub mod ramfs;
 pub mod sysfs;
 pub mod tmpfs;
 pub mod virtiofs;
+pub mod vsync;
 
 pub(super) fn init() {
     sysfs::init();
