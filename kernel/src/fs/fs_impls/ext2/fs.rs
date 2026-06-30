@@ -27,6 +27,7 @@ use device_id::DeviceId;
 use super::{
     block_group::{BlockGroup, RawBlockGroup},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
+    journal::{Ext2Journal, Ext2WriteKind, bio_segment_bytes},
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
 };
@@ -50,6 +51,7 @@ pub struct Ext2 {
     /// Backing block device.
     block_device: Arc<dyn BlockDevice>,
     /// Superblock with dirty tracking.
+    journal: Arc<Ext2Journal>,
     super_block: RwMutex<Dirty<SuperBlock>>,
     /// Block group descriptors and caches.
     block_groups: Vec<BlockGroup>,
@@ -169,6 +171,7 @@ impl Ext2 {
 
         let ext2 = Arc::new_cyclic(|weak_self| Ext2 {
             block_device: device,
+            journal,
             super_block: RwMutex::new(Dirty::new(super_block)),
             block_groups,
             nr_inodes_per_group,
@@ -190,6 +193,16 @@ impl Ext2 {
     /// Returns the maximum regular file size supported by this ext2 instance.
     pub(super) fn max_file_size(&self) -> usize {
         self.super_block.read().max_file_size()
+    }
+    
+    /// Returns the VSync journal.
+    pub(super) fn journal(&self) -> &Ext2Journal {
+        self.journal.as_ref()
+    }
+
+    /// Returns the device ID containing this filesystem.
+    pub fn container_device_id(&self) -> DeviceId {
+        self.block_device.id()
     }
 
     /// Returns whether Minix-style total blocks should be reported.
@@ -473,6 +486,27 @@ impl Ext2 {
         complete_fn: Option<BioCompleteFn>,
         io_batch: &mut IoBatch,
     ) -> Result<()> {
+        self.write_blocks_async_journaled(
+            bid,
+            bio_segment,
+            Ext2WriteKind::Metadata,
+            complete_fn,
+            io_batch,
+        )
+    }
+
+    /// Writes contiguous blocks asynchronously after first logging them in VSync.
+    pub(super) fn write_blocks_async_journaled(
+        &self,
+        bid: Ext2Bid,
+        bio_segment: BioSegment,
+        kind: Ext2WriteKind,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        let bytes = bio_segment_bytes(&bio_segment)?;
+        let offset = Bid::new(bid as u64).to_offset();
+        self.journal().log_write(offset, &bytes, kind)?;
         self.block_device.write_blocks_async(
             Bid::new(bid as u64),
             bio_segment,
@@ -506,6 +540,11 @@ impl Ext2 {
             group.sync_all(&self.group_descriptors_segment)?;
         }
         self.sync_metadata()
+    }
+
+    /// Checkpoints committed VSync records.
+    pub(super) fn checkpoint_journal(&self) -> Result<()> {
+        self.journal().checkpoint()
     }
 
     /// Allocates a new inode number.
@@ -665,8 +704,16 @@ impl Ext2 {
     }
 }
 
+impl Drop for Ext2 {
+    fn drop(&mut self) {
+        self.journal.destroy();
+    }
+}
+
 #[cfg(ktest)]
 mod test {
+
+pub(super) struct Ext2Type;
 
     use ostd::prelude::*;
 

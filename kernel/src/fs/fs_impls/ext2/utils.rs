@@ -71,6 +71,11 @@ impl<T: Debug> Dirty<T> {
     pub(super) fn clear_dirty(&mut self) {
         self.dirty = false;
     }
+
+    /// Marks the value dirty.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
 }
 
 impl<T: Debug> Deref for Dirty<T> {
